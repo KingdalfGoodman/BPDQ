@@ -11,4 +11,4 @@ Thank you for your interest!
 For any questions regarding the BPDQ, please open an issue or contact us via email:  
 **kingdalfgoodman[at]foxmail[dot]com**
 
-*Fun fact: The lowercase `bpdq` is perfectly symmetrical.*
+*Trivia: The lowercase `bpdq` is perfectly symmetrical.*
