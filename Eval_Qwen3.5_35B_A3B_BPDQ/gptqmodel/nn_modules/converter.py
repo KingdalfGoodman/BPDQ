@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
+
+def convert_gpt_oss_expert_converter(module, config):
+    import torch.nn as nn
+    import transformers.models.gpt_oss.modeling_gpt_oss as gpt_oss_modeling
+    from transformers.integrations.hub_kernels import use_kernel_forward_from_hub
+
+    from ..models.definitions.gpt_oss import GptOssExpertsNew
+
+    @use_kernel_forward_from_hub("MegaBlocksMoeMLP")
+    class GptOssMLPNew(nn.Module):
+        def __init__(self, config, ori_mlp=None):
+            super().__init__()
+            self.router = ori_mlp.router
+            experts_new = GptOssExpertsNew(config, ori_mlp.experts)
+            self.experts = experts_new
+
+        def forward(self, hidden_states):
+
+            # router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
+            
+            ### oss
+            router_outputs = self.router(hidden_states)
+
+            # 判断返回值的数量并灵活解包
+            if isinstance(router_outputs, tuple):
+                if len(router_outputs) == 2:
+                    router_scores, router_indices = router_outputs[0], router_outputs[1]
+                elif len(router_outputs) >= 3:
+                    # 许多开源 MoE (如 Mixtral/Qwen) 返回 (logits, weights, indices)
+                    # 量化通常需要的是 weights(scores) 和 indices，它们通常在最后或后两位
+                    # 你可以先尝试取前两个，如果形状不对，大概率是取后两个：
+                    # router_scores, router_indices = router_outputs[1], router_outputs[2]
+                    # 这里最稳妥的是按前两个取，如果后续报错 shape mismatch，再改成 [1] 和 [2]
+                    router_scores, router_indices = router_outputs[0], router_outputs[1]
+                        
+            
+            
+            
+            routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+            return routed_out, router_scores
+
+    # loop sub module to replace GptOssMLP with GptOssMLPNew
+    for name, sub_module in module.named_modules():
+        if isinstance(sub_module, gpt_oss_modeling.GptOssMLP):
+            new_module = GptOssMLPNew(config=config, ori_mlp=sub_module)
+            setattr(module, name, new_module)
+
+    return module
+
+def convert_llama4_expert_converter(module, config):
+    import torch
+    from transformers.models.llama4.modeling_llama4 import Llama4TextMLP, Llama4TextMoe
+
+    from ..utils.hf import no_init_weights
+
+    # adapted/modified from https://github.com/vllm-project/llm-compressor/blob/main/src/llmcompressor/modeling/llama4.py
+    class SequentialLlama4TextExperts(torch.nn.ModuleList):
+        def __init__(self, config, original):
+            self.num_experts = original.gate_up_proj.shape[0]
+            with no_init_weights():
+                super().__init__([Llama4TextMLP(config) for _ in range(self.num_experts)])
+            intermediate_size = original.down_proj.shape[1]
+
+            with torch.inference_mode():
+                # Batch process all expert parameters to avoid loops
+                gate_up_batch = torch.stack([original.gate_up_proj[i] for i in range(self.num_experts)])
+                down_batch = torch.stack([original.down_proj[i] for i in range(self.num_experts)])
+
+                # Batch split and transpose
+                gate_batch = gate_up_batch[:, :, :intermediate_size].transpose(-2, -1).contiguous()
+                up_batch = gate_up_batch[:, :, intermediate_size:].transpose(-2, -1).contiguous()
+                down_batch = down_batch.transpose(-2, -1).contiguous()
+
+                # Batch assignment
+                for i in range(self.num_experts):
+                    self[i].gate_proj.weight.data = gate_batch[i]
+                    self[i].up_proj.weight.data = up_batch[i]
+                    self[i].down_proj.weight.data = down_batch[i]
+
+    class SequentialLlama4TextMoe(torch.nn.Module):
+        def __init__(self, config, original):
+            super().__init__()
+            self.top_k = config.num_experts_per_tok
+            self.hidden_dim = config.hidden_size
+            self.num_experts = config.num_local_experts
+            self.experts = SequentialLlama4TextExperts(config, original.experts)
+            self.router = original.router
+            self.shared_expert = original.shared_expert
+
+        def forward(self, hidden_states: torch.Tensor):
+            hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+            router_logits = self.router(hidden_states)
+            if isinstance(router_logits, tuple):
+                router_scores, router_logits = router_logits
+                router_scores = router_scores.t()
+            else:
+                # transformers < 4.54.0 only returns router_logits
+                router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=1)
+
+                router_scores = (
+                    torch.full_like(router_logits, float("-inf"))
+                    .scatter_(1, router_indices, router_top_value)
+                    .transpose(0, 1)
+                )
+                router_scores = torch.sigmoid(router_scores.float()).to(hidden_states.dtype)
+
+            out = self.shared_expert(hidden_states)
+            for i in range(self.num_experts):
+                out += self.experts[i](hidden_states) * router_scores[i].reshape(-1, 1)
+
+            return out, router_logits
+
+    for name, sub_module in module.named_modules():
+        if isinstance(sub_module, Llama4TextMoe):
+            new_module = SequentialLlama4TextMoe(config=config.get_text_config(), original=sub_module)
+            setattr(module, name, new_module)
+
+    return module
+
+def convert_glm4v_mlp_converter(module, config):
+    import transformers.models.glm4v.modeling_glm4v as glm4v_modeling
+
+    from ..models.definitions.glm4v import Glm4vTextMLPNew
+
+    for name, sub_module in module.named_modules():
+        if isinstance(sub_module, glm4v_modeling.Glm4vTextMLP):
+            new_module = Glm4vTextMLPNew(config=config.get_text_config(), ori_mlp=sub_module)
+            setattr(module, name, new_module)
+    return module
+
+MODULE_CONVERTER_MAP = {
+    "llama4": convert_llama4_expert_converter,
+    "gpt_oss": convert_gpt_oss_expert_converter,
+    "glm4v": convert_glm4v_mlp_converter,
+}
