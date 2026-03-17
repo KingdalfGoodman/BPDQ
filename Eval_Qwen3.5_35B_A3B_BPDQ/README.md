@@ -9,4 +9,4 @@ For the versions of other related libraries, please refer to `requirements.txt`.
 
 * **Paper:** https://arxiv.org/abs/2602.04163
 * **HF:** https://huggingface.co/goodman20241017/Qwen3.5-35B-A3B-BPD2-g128
-**Note:** Not yet specifically optimized for MoE models. This is a preliminary experimental version.
+* **Note:** Not yet specifically optimized for MoE models. This is a preliminary experimental version.
