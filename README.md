@@ -4,6 +4,8 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2602.04163-b31b1b.svg)](https://arxiv.org/abs/2602.04163)
 
+🎉 **Accepted at ICML 2026.**
+
 Official implementation of BPDQ, a post-training quantization (PTQ) method that constructs a **variable quantization grid** via bit-plane decomposition and scalar coefficients, achieving high fidelity in low-bit regimes (2–3 bits) where conventional PTQ degrades sharply.
 
 ## Highlights
