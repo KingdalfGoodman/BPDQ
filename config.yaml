@@ -1,0 +1,51 @@
+
+# ===== Eval-only =====
+eval_only: false         
+eval_models:
+  - YOUR_PATH/quant_model/xxx
+
+
+# ===== Quantization -> Eval =====
+paths:
+  model_root: YOUR_PATH/model
+  quant_root: YOUR_PATH/model/quant_model
+  base_output_dir: YOUR_PATH/coding/eval_results/0514_Qwen3-0.6B_g128
+
+models:
+  - alias: 0514_Qwen3-0.6B_g128
+    pretrained: YOUR_PATH/model/Qwen3-0.6B
+
+sweep:
+  bpdq:
+    w_bits: [8]
+    msbits: [4, 3, 2]
+    group_sizes: [128]
+    n_iters: [10]
+    alpha: [1.0e-4]      # ⚠️ 1.0e-4, NOT 1e-4
+  # gptq:
+  #   w_bits: [2]
+  #   group_sizes: [32]
+  # awq:
+  #   w_bits: [4]
+  #   group_sizes: [64]
+  #   formats: [gemm]
+
+task_configs:
+  - {tasks: [wikitext],        eval_batch_size: 2,  num_fewshot: 0}
+  - {tasks: [arc_challenge],   eval_batch_size: 32, num_fewshot: 0}
+  - {tasks: [boolq],           eval_batch_size: 32, num_fewshot: 0}
+  - {tasks: [minerva_math500], eval_batch_size: 32, num_fewshot: 4}
+  - {tasks: [gsm8k],           eval_batch_size: 32, num_fewshot: 5}
+  - {tasks: [hellaswag],       eval_batch_size: 32, num_fewshot: 0}
+  - {tasks: [mmlu],            eval_batch_size: 4,  num_fewshot: 0}
+
+model_defaults:
+  sym: false
+  device_map: auto
+  dtype: bfloat16
+  trust_remote_code: true
+
+eval_defaults:
+  device: cuda
+  eval_trust_remote_code: true
+  eval_dtype: bfloat16

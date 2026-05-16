@@ -1,0 +1,3683 @@
+diff --git a/gptqmodel/looper/gptq_processor.py b/gptqmodel/looper/gptq_processor.py
+index e9b342a..ad6d3a4 100644
+--- a/gptqmodel/looper/gptq_processor.py
++++ b/gptqmodel/looper/gptq_processor.py
+@@ -112,6 +112,13 @@ class GPTQProcessor(LoopProcessor):
+ 
+         if qcfg_clone.gptaq is not None:
+             tmp = GPTAQ(module=module, qcfg=qcfg_clone)
++
++        ###
++        elif qcfg_clone.quant_method == METHOD.BPDQ:
++            from ..quantization.bpdq import BPDQ
++            tmp = BPDQ(module=module, qcfg=qcfg_clone)
++        ###
++        
+         else:
+             tmp = GPTQ(module=module, qcfg=qcfg_clone)
+             tmp.failsafe = normalize_failsafe(failsafe, qcfg_clone.failsafe)
+@@ -202,19 +209,26 @@ class GPTQProcessor(LoopProcessor):
+                     f"while processing '{module.full_name}'."
+                 )
+ 
+-        wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
+-
++        # wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
++        # workspace_summary = getattr(g, "_borrow_workspace_last_summary", None)
++        # workspace_totals = getattr(g, "_borrow_workspace_totals", None)
++        # module.stream_state_payload_to_cpu({
++        #         "q_scales": q_scales,
++        #         "q_zeros": q_zeros,
++        #         "q_g_idx": q_g_idx,
++        #     },)
++        # del q_scales, q_zeros, q_g_idx
++        ### 
++        ### change to quant_payload DICT
++        # need g.quantize() return: wq, quant_payload, duration, avg_loss, damp_percent, nsamples
++        wq, quant_payload, duration, avg_loss, damp_percent, nsamples = g.quantize()
+         workspace_summary = getattr(g, "_borrow_workspace_last_summary", None)
+         workspace_totals = getattr(g, "_borrow_workspace_totals", None)
++        module.stream_state_payload_to_cpu(quant_payload)
++        del quant_payload
++        ###
++
+ 
+-        module.stream_state_payload_to_cpu(
+-            {
+-                "q_scales": q_scales,
+-                "q_zeros": q_zeros,
+-                "q_g_idx": q_g_idx,
+-            },
+-        )
+-        del q_scales, q_zeros, q_g_idx
+ 
+         with self.lock:
+             self.durations.append(duration)
+@@ -330,14 +344,28 @@ class GPTQProcessor(LoopProcessor):
+             module.state.pop("w", None) #
+             module.state.pop("w_wq_diff", None)
+ 
+-            # need to clone to due to steamed pinned memory and access on diff thread
+-            q_zeros = module.state.pop("q_zeros").clone()
+-            q_scales = module.state.pop("q_scales").clone()
+-            q_g_idx = module.state.pop("q_g_idx").clone()
++        #     # need to clone to due to steamed pinned memory and access on diff thread
++        #     q_zeros = module.state.pop("q_zeros").clone()
++        #     q_scales = module.state.pop("q_scales").clone()
++        #     q_g_idx = module.state.pop("q_g_idx").clone()
++        # assert q_zeros.device == CPU
++        # assert q_scales.device == CPU
++        # assert q_g_idx.device == CPU
++            ###
++            ### From module.state get payload，to CPU
++            # whatever GPTQ's q_scales or BPDQ's c/B，get it.
++            final_payload = {}
++            keys_to_pop = list(module.state.keys())
++            for key in keys_to_pop:
++                tensor = module.state.pop(key)
++                if isinstance(tensor, torch.Tensor):
++                    final_payload[key] = tensor.clone()
++                    assert final_payload[key].device == CPU
++                else:
++                    final_payload[key] = tensor
++            ###
++
+ 
+-        assert q_zeros.device == CPU
+-        assert q_scales.device == CPU
+-        assert q_g_idx.device == CPU
+ 
+         layers = find_modules(model.model)
+         module_label = getattr(module, "full_name", getattr(module, "name", ""))
+@@ -345,6 +373,11 @@ class GPTQProcessor(LoopProcessor):
+ 
+         # replace module with quantized module
+         timer = getattr(model, "quant_region_timer", None)
++        ### get BPDQ params
++        extra_kwargs = {}
++        if self.qcfg.quant_method == METHOD.BPDQ and self.qcfg.bpdq is not None:
++            extra_kwargs["msbits"] = self.qcfg.bpdq.msbits
++        ###
+ 
+         create_start = time.perf_counter() if timer is not None else None
+         with log_time_block(
+@@ -367,6 +400,7 @@ class GPTQProcessor(LoopProcessor):
+                     lm_head_name=model.lm_head,
+                     pack_dtype=self.qcfg.pack_dtype,
+                     register_buffers=False,
++                    **extra_kwargs  ###
+                 )
+         if timer is not None and create_start is not None:
+             timer.record(
+@@ -388,6 +422,11 @@ class GPTQProcessor(LoopProcessor):
+             module_name=module_label,
+         ):
+             with parent_module_lock(parent_key):
++                ###
++                q_scales = final_payload.pop("q_scales", None)
++                q_zeros = final_payload.pop("q_zeros", None)
++                q_g_idx = final_payload.pop("q_g_idx", None)
++                ###
+                 packer_label = pack_module(
+                     name=module.full_name,
+                     qModules=qModules,
+@@ -398,6 +437,7 @@ class GPTQProcessor(LoopProcessor):
+                     quant_linear_cls=model.qlinear_kernel,
+                     lock=self.lock,
+                     quantize_config=self.qcfg,
++                    **final_payload ###
+                 )
+         if timer is not None and pack_start is not None:
+             timer.record(
+@@ -422,6 +462,12 @@ class GPTQProcessor(LoopProcessor):
+         model.quantize_config.quant_method = METHOD.GPTQ
+ 
+         super().finalize(model=model, **kwargs)
++    # def finalize(self, model: BaseQModel, **kwargs):
++    #     model.quantized = True
++    #     if model.quantize_config.quant_method != METHOD.BPDQ:
++    #         model.quantize_config.quant_method = METHOD.GPTQ
++    #     super().finalize(model=model, **kwargs)
++
+ 
+     def verify_calibration_dataset(self, processor_index: int) -> bool:
+         if self.calibration_dataset is None:
+diff --git a/gptqmodel/looper/stage_layer.py b/gptqmodel/looper/stage_layer.py
+index 0410a31..9ef5dd9 100644
+--- a/gptqmodel/looper/stage_layer.py
++++ b/gptqmodel/looper/stage_layer.py
+@@ -12,6 +12,8 @@ import threading
+ import time
+ from concurrent.futures import as_completed
+ from typing import TYPE_CHECKING, Dict, List, Optional
++
++from defuser.modeling.replace_modules import materialize_model ###
+ from ..nn_modules.hooked_linear import replace_module_with_hooked_legacy
+ from ..nn_modules.converter import MODULE_CONVERTER_MAP
+ from ..quantization.config import GcMode
+@@ -88,6 +90,8 @@ def run_layer_stage(
+             else:
+                 layer_descriptor = str(layer_index)
+ 
++        materialize_model(module) ###   
++
+         cur_layer_device = get_device(module)
+         full = find_modules(module, name=looper.gptq_model.lm_head if is_lm_head_module else "")
+ 
+@@ -264,6 +268,11 @@ def run_layer_stage(
+                 #     )
+ 
+                 try:
++                    # Reset current subset for MoE lifecycle hooks as we do not need to collect activation at this stage,
++                    # and need to collect only outputs produced by original forward
++                    looper._current_subset = None ###
++
++
+                     layer_outputs = looper._run_forward_batches(
+                         module=module,
+                         processor=processor,
+diff --git a/gptqmodel/looper/stage_subset.py b/gptqmodel/looper/stage_subset.py
+index 18b4931..a7b56f9 100644
+--- a/gptqmodel/looper/stage_subset.py
++++ b/gptqmodel/looper/stage_subset.py
+@@ -12,7 +12,7 @@ import math
+ import re
+ import time
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Callable, Dict, List, Optional
++from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+ 
+ import torch
+ 
+@@ -22,7 +22,7 @@ from .. import DEBUG_ON, DEVICE_THREAD_POOL
+ from ..looper.gptq_processor import GPTQProcessor
+ from ..looper.loop_processor import LoopProcessor
+ from ..looper.named_module import NamedModule
+-from ..quantization.config import GcMode, VramStrategy
++from ..quantization.config import VramStrategy, GcMode, ExpertsRoutingBypass
+ from ..utils.device import get_device
+ from ..utils.logger import setup_logger
+ from ..utils.torch import torch_empty_cache, torch_sync
+@@ -47,11 +47,11 @@ class SubsetStageResult:
+     forward_context: Optional[SubsetForwardContext]
+ 
+ 
+-def run_subset_stage(
++def _run_single_subset_pass(
+     looper: 'ModuleLooper',
+-    *,
+     processor: LoopProcessor,
+     module: torch.nn.Module,
++    subset: Dict[str, NamedModule],
+     layer_inputs: List[List[torch.Tensor]],
+     layer_input_kwargs: List[Dict[str, torch.Tensor]],
+     position_ids: List[torch.Tensor],
+@@ -61,355 +61,200 @@ def run_subset_stage(
+     layer_descriptor: str,
+     layer_title: str,
+     layer_index: int,
+-    layers_prefix: Optional[str],
+-    subset: Dict[str, NamedModule],
+     subset_index: int,
+     subset_total: int,
+     full,
+     failsafe,
+     shared_kv_cache_dict: Dict[int, torch.Tensor],
+     pb,
+-    log=None,
++    logger,
++    is_awq_processor: bool,
++    forward_total_rows: int,
++    forward_row_counts: List[int],
++    batch_count: int,
++    forward_device_map: Dict[str, torch.device],
++    subset_forward_serial: bool,
+     region_timer=None,
+     previous_processed_subset: Optional[Dict[str, NamedModule]] = None,
+     subset_event_cb: Optional[Callable[..., None]] = None,
+-) -> SubsetStageResult:
+-    """Process a single subset of modules within the layer quantization loop."""
+-    logger = log or setup_logger()
+-
+-    processor_name = processor.name() if hasattr(processor, "name") else type(processor).__name__
+-    processor_name_lower = processor_name.lower()
+-    is_awq_processor = processor_name_lower.startswith("awq")
+-
+-    def emit_subset_event(stage: str) -> None:
+-        if subset_event_cb is None:
+-            return
+-        subset_event_cb(
+-            stage=stage,
+-            layer_idx=layer_index,
+-            subset_index=subset_index,
+-            subset_total=subset_total,
+-            module_names=list(subset.keys()),
+-            processor=processor_name,
+-        )
+-
+-    # TODO FIXME: If a full layer has no module to quantize a simple forward() is enough and output is captured 
+-    # to be used as next layer's input. So one pass forward (entire layer simple forward wihout need of dealing 
+-    # with subset loops and micro forward loops, just full layer, usally XXXDecodeLayer.forward(). 
+-    # So output = current_layer.forward() is enough or sometimes just calling the layer callable like layer() 
+-    # which same as layer.forward().
+-    #
+-    # Assume layer 2 has no modules to quantize. At beginniing loop for layer 2, we have layer_output 
+-    # from completed forward_replay() of layer 1. Then pass this to layer 2 (as a whole) as layer_input 
+-    # and store ouput, then immediately loop to layer 3 without any further subset work that is only necessary 
+-    # if we need to quantize part of a layer.
+-    #
+-    # if len(subset) == 0:
+-    #     if logger.isEnabledFor(logging.DEBUG):
+-    #         logger.debug(
+-    #             "StageSubset: layer=%s subset=%s/%s processor=%s produced empty subset (names=%s)",
+-    #             layer_index,
+-    #             subset_index + 1,
+-    #             subset_total,
+-    #             processor_name,
+-    #             subset_names,
+-    #         )
+-    #     return SubsetStageResult(processed_subset={}, layer_inputs=layer_inputs, forward_context=None)
++    return_outputs: bool = False,
++    disable_moe_hooks: bool = False,
++) -> Tuple[Dict[str, NamedModule], Optional[List[List[torch.Tensor]]]]:
++    """Execute forward and quantization for a specific subset/chunk."""
++    
++    handle = []
++    subset_size = len(subset)
++    
++    # Determine MoE block name for hook selection
++    moe_block_name = None
++    if looper.gptq_model and hasattr(looper.gptq_model, 'moe_lifecycle_hooks'):
++        hooks = looper.gptq_model.moe_lifecycle_hooks
++        if hooks is not None:
++            moe_block = hooks.get_moe_block(module, looper.gptq_model.__class__)
++            if moe_block is not None:
++                # Get the full name/path of the MoE block
++                for mod_name, mod in module.named_modules():
++                    if mod is moe_block:
++                        moe_block_name = mod_name
++                        break
++
++    for idx, (name, m) in enumerate(subset.items()):
++        # Register the forward hook that captures activations for quantization.
++        # The final module optionally flips a flag so processors can trigger
++        # once-per-subset logic after the forward pass.
++        is_last = (idx == subset_size - 1)
++        hook_source = getattr(m, "full_name", None)
++        if hook_source is None:
++            hook_source = getattr(m, "name", name)
++        if hook_source is None:
++            hook_source = str(name)
++
++        # Determine if this module is part of MoE block (needs pre-hook to avoid StopForward)
++        is_moe_module = moe_block_name and name.startswith(moe_block_name + ".")
++
++        if hasattr(subset[name], 'forward_hook'):
++            original_hook = processor.pre_process_fwd_hook(name)
++            # Use pre-hook for MoE modules to fire before StopForward
++            if is_moe_module:
++                subset[name].forward_hook = looper._masked_pre_hook_wrapper(processor, original_hook, hook_source)
++            else:
++                subset[name].forward_hook = looper._masked_hook_wrapper(processor, original_hook, hook_source)
++            enable_stop = processor.fwd_after_process or getattr(processor, "subset_forward_early_stop", False)
++            if is_last and enable_stop:
++                subset[name].forward_hook_last = True
++        else:
++            original_hook = processor.pre_process_fwd_hook(name)
++            # Use pre-hook registration for MoE modules
++            if is_moe_module:
++                handle.append(subset[name].register_forward_hook(
++                    looper._masked_pre_hook_wrapper(processor, original_hook, hook_source)
++                ))
++            else:
++                handle.append(subset[name].register_forward_hook(
++                    looper._masked_hook_wrapper(processor, original_hook, hook_source)
++                ))
+ 
+     if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
+         if is_awq_processor:
+             logger.debug(
+-                "StageSubset[awq]: layer=%s subset=%s/%s modules=%s sample=%s",
++                "StageSubset[awq]: layer=%s subset=%s/%s processor=%s registering hooks for %s modules",
+                 layer_index,
+                 subset_index + 1,
+                 subset_total,
+                 len(subset),
+-                list(subset.keys())[:8],
+             )
+         else:
+             logger.debug(
+-                "StageSubset: layer=%s subset=%s/%s processor=%s created %s modules (sample=%s)",
++                "StageSubset: layer=%s subset=%s/%s processor=%s registering hooks for %s modules",
+                 layer_index,
+                 subset_index + 1,
+                 subset_total,
+-                processor_name,
++                getattr(processor, "name", type(processor).__name__),
+                 len(subset),
+-                list(subset.keys())[:8],
+             )
+ 
+-    moe_group_keys_all: List[str] = []
+-    forward_device_map: Dict[str, torch.device] = {}
+-    subset_forward_serial = False
+-
+-    attention_subset = bool(subset) and all(
+-        looper._is_attention_module_name(name) for name in subset
+-    )
+-
+-    moe_group_key_by_name: Dict[str, Optional[str]] = {
+-        name: looper._extract_moe_group_key(name)
+-        for name in subset
+-    }
+-    moe_module_names = [
+-        name for name, group_key in moe_group_key_by_name.items()
+-        if group_key is not None
+-    ]
+-    moe_modules_set = set(moe_module_names)
+-    is_moe_subset = len(moe_module_names) >= looper._moe_subset_threshold
+-
+-    if is_moe_subset:
+-        expert_groups: Dict[str, List[str]] = {}
+-        combined_names: List[str] = list(subset.keys())
+-        if full is not None:
+-            for candidate in full.keys():
+-                if candidate not in subset:
+-                    combined_names.append(candidate)
++    if subset_event_cb:
++        subset_event_cb(stage="forward_start", layer_idx=layer_index, subset_index=subset_index, subset_total=subset_total, module_names=list(subset.keys()), processor=getattr(processor, "name", type(processor).__name__))
+ 
+-        for sub_name in combined_names:
+-            # Group every expert (including ones outside the current subset) so
+-            # load balancing decisions can span the full MoE family.
+-            group_key = looper._extract_moe_group_key(sub_name)
+-            if group_key is None:
+-                continue
+-            expert_groups.setdefault(group_key, []).append(sub_name)
++    fwd_start = time.perf_counter()
++    forward_source = f"{layer_descriptor}:subset{subset_index + 1}/{subset_total}"
+ 
+-        moe_group_keys_all = list(expert_groups.keys())
+-
+-        for name, named_module in subset.items():
+-            setattr(named_module, "moe_enabled", name in moe_modules_set)
+-
+-        if looper._vram_strategy == VramStrategy.BALANCED:
+-            devices = [
+-                dev for dev in looper._quant_devices
+-                if dev is not None and getattr(dev, "type", None) != "cpu"
+-            ]
+-            if len(devices) > 1 and expert_groups:
+-                assignable_group_keys: List[str] = []
+-                for group_key, module_names in expert_groups.items():
+-                    suffixes = {name.rsplit(".", 1)[-1] for name in module_names}
+-                    # TODO: Need to make this configuratble and not static string based. Some moe use wN naming.
+-                    if {"gate_proj", "up_proj"}.issubset(suffixes) or {"w1", "w3"}.issubset(suffixes):
+-                        assignable_group_keys.append(group_key)
+-
+-                if assignable_group_keys:
+-                    groups_per_device = max(
+-                        math.ceil(len(assignable_group_keys) / len(devices)), 1
+-                    )
+-                    for group_index, group_key in enumerate(assignable_group_keys):
+-                        device_idx = min(group_index // groups_per_device, len(devices) - 1)
+-                        target_device = devices[device_idx]
+-                        for module_name in expert_groups[group_key]:
+-                            forward_device_map[module_name] = target_device
+-
+-        subset_forward_serial = looper._vram_strategy == VramStrategy.BALANCED
+-        if subset_forward_serial:
+-            active_group_count = len(moe_group_keys_all)
+-            if active_group_count == 0:
+-                subset_forward_serial = False
+-            elif attention_subset and active_group_count <= looper._moe_subset_threshold:
+-                subset_forward_serial = False
+-    else:
+-        for named_module in subset.values():
+-            setattr(named_module, "moe_enabled", False)
+-
+-    auto_forward_data_parallel = getattr(
+-        looper.gptq_model.quantize_config,
+-        "auto_forward_data_parallel",
+-        True,
++    need_outputs = not processor.fwd_after_process
++    reuse_kv = bool(getattr(module, "reuse_kv", False))
++    forward_msg = (
++        "Forward: "
++        f"Layer=`{layer_descriptor}`, subset={subset_index + 1}/{subset_total}, "
++        f"batches={batch_count}"
+     )
+-    subset_forward_serial = subset_forward_serial or not auto_forward_data_parallel
+-
+-    handle = []
+-
+-    # some processes are simple and not require forward captures
+-    if processor.require_fwd:
+-        batch_count = looper._resolve_batch_total(
+-            getattr(processor, "num_batches", None),
+-            layer_inputs,
++    forward_pb = (
++        logger.pb(range(forward_total_rows))
++           .manual()
++           .set(show_left_steps=False)
++    )
++    forward_pb.title(forward_msg).subtitle(
++        f"Row 0/{forward_total_rows}"
++    ).draw()
++
++    previous_forward_devices: Dict[str, torch.device] = {}
++    preserve_devices = bool(forward_device_map)
++    if forward_device_map:
++        previous_forward_devices = looper._apply_forward_device_overrides(
++            subset,
++            forward_device_map,
++            fallback_modules=full,
+         )
+-        forward_row_counts = list(looper._collect_row_counts(layer_inputs))
+-        if not forward_row_counts and batch_count > 0:
+-            forward_row_counts = [1] * batch_count
+-        if len(forward_row_counts) > batch_count:
+-            forward_row_counts = forward_row_counts[:batch_count]
+-        forward_total_rows = sum(forward_row_counts) if forward_row_counts else batch_count
+-        forward_total_rows = max(forward_total_rows, 1)
+-        if len(forward_row_counts) < batch_count:
+-            forward_row_counts.extend([1] * (batch_count - len(forward_row_counts)))
+-
+-        subset_size = len(subset)
+-
+-        # Determine MoE block name for hook selection
+-        moe_block_name = None
+-        if looper.gptq_model and hasattr(looper.gptq_model, 'moe_lifecycle_hooks'):
+-            hooks = looper.gptq_model.moe_lifecycle_hooks
+-            if hooks is not None:
+-                moe_block = hooks.get_moe_block(module, looper.gptq_model.__class__)
+-                if moe_block is not None:
+-                    # Get the full name/path of the MoE block
+-                    for mod_name, mod in module.named_modules():
+-                        if mod is moe_block:
+-                            moe_block_name = mod_name
+-                            break
+-
+-        for idx, (name, m) in enumerate(subset.items()):
+-            # Register the forward hook that captures activations for quantization.
+-            # The final module optionally flips a flag so processors can trigger
+-            # once-per-subset logic after the forward pass.
+-            is_last = (idx == subset_size - 1)
+-            hook_source = getattr(m, "full_name", None)
+-            if hook_source is None:
+-                hook_source = getattr(m, "name", name)
+-            if hook_source is None:
+-                hook_source = str(name)
+-
+-            # Determine if this module is part of MoE block (needs pre-hook to avoid StopForward)
+-            is_moe_module = moe_block_name and name.startswith(moe_block_name + ".")
+-
+-            if hasattr(subset[name], 'forward_hook'):
+-                original_hook = processor.pre_process_fwd_hook(name)
+-                # Use pre-hook for MoE modules to fire before StopForward
+-                if is_moe_module:
+-                    subset[name].forward_hook = looper._masked_pre_hook_wrapper(processor, original_hook, hook_source)
+-                else:
+-                    subset[name].forward_hook = looper._masked_hook_wrapper(processor, original_hook, hook_source)
+-                enable_stop = processor.fwd_after_process or getattr(processor, "subset_forward_early_stop", False)
+-                if is_last and enable_stop:
+-                    subset[name].forward_hook_last = True
+-            else:
+-                original_hook = processor.pre_process_fwd_hook(name)
+-                # Use pre-hook registration for MoE modules
+-                if is_moe_module:
+-                    handle.append(subset[name].register_forward_hook(
+-                        looper._masked_pre_hook_wrapper(processor, original_hook, hook_source)
+-                    ))
+-                else:
+-                    handle.append(subset[name].register_forward_hook(
+-                        looper._masked_hook_wrapper(processor, original_hook, hook_source)
+-                    ))
+-
+-        if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
+-            if is_awq_processor:
+-                logger.debug(
+-                    "StageSubset[awq]: layer=%s subset=%s/%s processor=%s registering hooks for %s modules",
+-                    layer_index,
+-                    subset_index + 1,
+-                    subset_total,
+-                    len(subset),
+-                )
+-            else:
+-                logger.debug(
+-                    "StageSubset: layer=%s subset=%s/%s processor=%s registering hooks for %s modules",
+-                    layer_index,
+-                    subset_index + 1,
+-                    subset_total,
+-                    processor_name,
+-                    len(subset),
+-                )
+-
+-        emit_subset_event("forward_start")
+-
+-        fwd_start = time.perf_counter()
+-        forward_source = f"{layer_descriptor}:subset{subset_index + 1}/{subset_total}"
+ 
+-        need_outputs = not processor.fwd_after_process
+-        reuse_kv = bool(getattr(module, "reuse_kv", False))
+-        forward_msg = (
+-            "Forward: "
+-            f"Layer=`{layer_descriptor}`, subset={subset_index + 1}/{subset_total}, "
+-            f"batches={batch_count}"
+-        )
+-        forward_pb = (
+-            logger.pb(range(forward_total_rows))
+-               .manual()
+-               .set(show_left_steps=False)
++    try:
++        # Set the current subset for MoE lifecycle hooks
++        if disable_moe_hooks:
++            looper._current_subset = None
++        else:
++            looper._current_subset = subset
++        forward_outputs = looper._run_forward_batches(
++            module=module,
++            processor=processor,
++            layer_inputs=layer_inputs,
++            layer_input_kwargs=layer_input_kwargs,
++            position_ids=position_ids,
++            attention_masks=attention_masks,
++            cur_layer_device=cur_layer_device,
++            is_lm_head_module=is_lm_head_module,
++            shared_kv_cache_dict=shared_kv_cache_dict,
++            layer_index=layer_index,
++            need_outputs=need_outputs,
++            reuse_kv=reuse_kv,
++            progress_pb=forward_pb,
++            progress_title=forward_msg,
++            progress_stage="Forward",
++            progress_rows_per_batch=forward_row_counts,
++            progress_total_rows=forward_total_rows,
++            force_serial=subset_forward_serial,
++            preserve_module_devices=preserve_devices,
+         )
+-        forward_pb.title(forward_msg).subtitle(
+-            f"Row 0/{forward_total_rows}"
+-        ).draw()
+-
+-        previous_forward_devices: Dict[str, torch.device] = {}
+-        preserve_devices = bool(forward_device_map)
++    finally:
+         if forward_device_map:
+-            previous_forward_devices = looper._apply_forward_device_overrides(
++            looper._restore_forward_device_overrides(
+                 subset,
+-                forward_device_map,
++                previous_forward_devices,
+                 fallback_modules=full,
+             )
++        if forward_pb is not None:
++            forward_pb.close()
++    
++    returned_outputs = None
++    if need_outputs:
++        processor.receive_layer_inputs(forward_outputs)
++        if return_outputs:
++             returned_outputs = processor.inputs_cache.layer_inputs
++        del forward_outputs
++    
++    if subset_event_cb:
++        subset_event_cb(stage="forward_end", layer_idx=layer_index, subset_index=subset_index, subset_total=subset_total, module_names=list(subset.keys()), processor=getattr(processor, "name", type(processor).__name__))
++
++
++    fwd_time = time.perf_counter() - fwd_start
++    processor.set_fwd_time(fwd_time)
++    if region_timer is not None:
++        region_timer.record(
++            "pre_quant_forward",
++            fwd_time,
++            source=forward_source,
++        )
+ 
+-        try:
+-            # Set the current subset for MoE lifecycle hooks
+-            looper._current_subset = subset
+-            forward_outputs = looper._run_forward_batches(
+-                module=module,
+-                processor=processor,
+-                layer_inputs=layer_inputs,
+-                layer_input_kwargs=layer_input_kwargs,
+-                position_ids=position_ids,
+-                attention_masks=attention_masks,
+-                cur_layer_device=cur_layer_device,
+-                is_lm_head_module=is_lm_head_module,
+-                shared_kv_cache_dict=shared_kv_cache_dict,
+-                layer_index=layer_index,
+-                need_outputs=need_outputs,
+-                reuse_kv=reuse_kv,
+-                progress_pb=forward_pb,
+-                progress_title=forward_msg,
+-                progress_stage="Forward",
+-                progress_rows_per_batch=forward_row_counts,
+-                progress_total_rows=forward_total_rows,
+-                force_serial=subset_forward_serial,
+-                preserve_module_devices=preserve_devices,
+-            )
+-        finally:
+-            if forward_device_map:
+-                looper._restore_forward_device_overrides(
+-                    subset,
+-                    previous_forward_devices,
+-                    fallback_modules=full,
+-                )
+-            if forward_pb is not None:
+-                forward_pb.close()
+-        if need_outputs:
+-            processor.receive_layer_inputs(forward_outputs)
+-            layer_inputs = processor.inputs_cache.layer_inputs
+-            del forward_outputs
+-        emit_subset_event("forward_end")
+-
+-        fwd_time = time.perf_counter() - fwd_start
+-        processor.set_fwd_time(fwd_time)
+-        if region_timer is not None:
+-            region_timer.record(
+-                "pre_quant_forward",
+-                fwd_time,
+-                source=forward_source,
+-            )
+-
+-        for h in handle:
+-            # Detach temporary hooks to avoid leaking state into future passes.
+-            h.remove()
++    for h in handle:
++        # Detach temporary hooks to avoid leaking state into future passes.
++        h.remove()
+ 
+-        for name in subset:
+-            # Reset inline hook attributes on NamedModule wrappers so future passes
+-            # do not reuse state from this subset run.
+-            if hasattr(subset[name], 'forward_hook'):
+-                subset[name].forward_hook = None
+-                subset[name].forward_hook_last = False
+-
+-        if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
+-            torch_sync()
+-            torch_empty_cache()
+-    else:
+-        if DEBUG_ON:
+-            logger.debug(
+-                "StageSubset: processor=%s layer=%s subset=%s/%s skipping forward (require_fwd=False)",
+-                processor_name,
+-                layer_index,
+-                subset_index + 1,
+-                subset_total,
+-            )
+-        emit_subset_event("forward_start")
+-        emit_subset_event("forward_end")
++    for name in subset:
++        # Reset inline hook attributes on NamedModule wrappers so future passes
++        # do not reuse state from this subset run.
++        if hasattr(subset[name], 'forward_hook'):
++            subset[name].forward_hook = None
++            subset[name].forward_hook_last = False
+ 
++    if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
++        torch_sync()
++        torch_empty_cache()
+     moe_skip_modules = []
+     failsafe_enabled = failsafe is not None
+     if isinstance(processor, GPTQProcessor) or isinstance(processor, QQQProcessor) or isinstance(processor, AWQProcessor):
+@@ -461,7 +306,9 @@ def run_subset_stage(
+     processed_subset: Dict[str, NamedModule] = {}
+     futures = []
+ 
+-    emit_subset_event("quant_start")
++    if subset_event_cb:
++        subset_event_cb(stage="quant_start", layer_idx=layer_index, subset_index=subset_index, subset_total=subset_total, module_names=list(subset.keys()), processor=getattr(processor, "name", type(processor).__name__))
++
+ 
+     @torch.inference_mode()
+     def _process_on_worker(
+@@ -556,7 +403,350 @@ def run_subset_stage(
+     if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
+         torch_empty_cache()
+ 
+-    emit_subset_event("quant_complete")
++    if subset_event_cb:
++        subset_event_cb(stage="quant_complete", layer_idx=layer_index, subset_index=subset_index, subset_total=subset_total, module_names=list(subset.keys()), processor=getattr(processor, "name", type(processor).__name__))
++
++    return processed_subset, returned_outputs
++
++
++def run_subset_stage(
++    looper: 'ModuleLooper',
++    *,
++    processor: LoopProcessor,
++    module: torch.nn.Module,
++    layer_inputs: List[List[torch.Tensor]],
++    layer_input_kwargs: List[Dict[str, torch.Tensor]],
++    position_ids: List[torch.Tensor],
++    attention_masks: List[torch.Tensor],
++    cur_layer_device: torch.device,
++    is_lm_head_module: bool,
++    layer_descriptor: str,
++    layer_title: str,
++    layer_index: int,
++    layers_prefix: Optional[str],
++    subset: Dict[str, NamedModule],
++    subset_index: int,
++    subset_total: int,
++    full,
++    failsafe: bool,
++    shared_kv_cache_dict: Dict[int, torch.Tensor],
++    pb,
++    log=None,
++    region_timer=None,
++    previous_processed_subset: Optional[Dict[str, NamedModule]] = None,
++    subset_event_cb: Optional[Callable[..., None]] = None,
++) -> SubsetStageResult:
++    """Process a single subset of modules within the layer quantization loop."""
++    logger = log or setup_logger()
++
++    processor_name = processor.name() if hasattr(processor, "name") else type(processor).__name__
++    processor_name_lower = processor_name.lower()
++    is_awq_processor = processor_name_lower.startswith("awq")
++
++    def emit_subset_event(stage: str) -> None:
++        if subset_event_cb is None:
++            return
++        subset_event_cb(
++            stage=stage,
++            layer_idx=layer_index,
++            subset_index=subset_index,
++            subset_total=subset_total,
++            module_names=list(subset.keys()),
++            processor=processor_name,
++        )
++
++    if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
++        if is_awq_processor:
++            logger.debug(
++                "StageSubset[awq]: layer=%s subset=%s/%s modules=%s sample=%s",
++                layer_index,
++                subset_index + 1,
++                subset_total,
++                len(subset),
++                list(subset.keys())[:8],
++            )
++        else:
++            logger.debug(
++                "StageSubset: layer=%s subset=%s/%s processor=%s created %s modules (sample=%s)",
++                layer_index,
++                subset_index + 1,
++                subset_total,
++                processor_name,
++                len(subset),
++                list(subset.keys())[:8],
++            )
++
++    moe_group_keys_all: List[str] = []
++    forward_device_map: Dict[str, torch.device] = {}
++    subset_forward_serial = False
++
++    attention_subset = bool(subset) and all(
++        looper._is_attention_module_name(name) for name in subset
++    )
++
++    moe_group_key_by_name: Dict[str, Optional[str]] = {
++        name: looper._extract_moe_group_key(name)
++        for name in subset
++    }
++    moe_module_names = [
++        name for name, group_key in moe_group_key_by_name.items()
++        if group_key is not None
++    ]
++    moe_modules_set = set(moe_module_names)
++    is_moe_subset = len(moe_module_names) >= looper._moe_subset_threshold
++
++    if is_moe_subset:
++        expert_groups: Dict[str, List[str]] = {}
++        combined_names: List[str] = list(subset.keys())
++        if full is not None:
++            for candidate in full.keys():
++                if candidate not in subset:
++                    combined_names.append(candidate)
++
++        for sub_name in combined_names:
++            # Group every expert (including ones outside the current subset) so
++            # load balancing decisions can span the full MoE family.
++            group_key = looper._extract_moe_group_key(sub_name)
++            if group_key is None:
++                continue
++            expert_groups.setdefault(group_key, []).append(sub_name)
++
++        moe_group_keys_all = list(expert_groups.keys())
++
++        for name, named_module in subset.items():
++            setattr(named_module, "moe_enabled", name in moe_modules_set)
++
++        if looper._vram_strategy == VramStrategy.BALANCED:
++            devices = [
++                dev for dev in looper._quant_devices
++                if dev is not None and getattr(dev, "type", None) != "cpu"
++            ]
++            if len(devices) > 1 and expert_groups:
++                assignable_group_keys: List[str] = []
++                for group_key, module_names in expert_groups.items():
++                    suffixes = {name.rsplit(".", 1)[-1] for name in module_names}
++                    # TODO: Need to make this configuratble and not static string based. Some moe use wN naming.
++                    if {"gate_proj", "up_proj"}.issubset(suffixes) or {"w1", "w3"}.issubset(suffixes):
++                        assignable_group_keys.append(group_key)
++
++                if assignable_group_keys:
++                    groups_per_device = max(
++                        math.ceil(len(assignable_group_keys) / len(devices)), 1
++                    )
++                    for group_index, group_key in enumerate(assignable_group_keys):
++                        device_idx = min(group_index // groups_per_device, len(devices) - 1)
++                        target_device = devices[device_idx]
++                        for module_name in expert_groups[group_key]:
++                            forward_device_map[module_name] = target_device
++
++        subset_forward_serial = looper._vram_strategy == VramStrategy.BALANCED
++        if subset_forward_serial:
++            active_group_count = len(moe_group_keys_all)
++            if active_group_count == 0:
++                subset_forward_serial = False
++            elif attention_subset and active_group_count <= looper._moe_subset_threshold:
++                subset_forward_serial = False
++    else:
++        for named_module in subset.values():
++            setattr(named_module, "moe_enabled", False)
++
++    auto_forward_data_parallel = getattr(
++        looper.gptq_model.quantize_config,
++        "auto_forward_data_parallel",
++        True,
++    )
++    subset_forward_serial = subset_forward_serial or not auto_forward_data_parallel
++
++    # Prepare Loop Parameters
++
++    forward_total_rows = 1
++    forward_row_counts = []
++    batch_count = 0
++    if processor.require_fwd:
++        batch_count = looper._resolve_batch_total(
++            getattr(processor, "num_batches", None),
++            layer_inputs,
++        )
++        forward_row_counts = list(looper._collect_row_counts(layer_inputs))
++        if not forward_row_counts and batch_count > 0:
++            forward_row_counts = [1] * batch_count
++        if len(forward_row_counts) > batch_count:
++            forward_row_counts = forward_row_counts[:batch_count]
++        forward_total_rows = sum(forward_row_counts) if forward_row_counts else batch_count
++        forward_total_rows = max(forward_total_rows, 1)
++        if len(forward_row_counts) < batch_count:
++            forward_row_counts.extend([1] * (batch_count - len(forward_row_counts)))
++    
++    # Check for MoE batching
++    # batch_size is only available when using ExpertsRoutingBypass routing strategy
++    moe_routing = looper.gptq_model.quantize_config.moe
++    batch_size = None
++    if moe_routing is not None and isinstance(moe_routing.routing, ExpertsRoutingBypass):
++        batch_size = moe_routing.routing.batch_size
++    batching_enabled = is_moe_subset and batch_size is not None and batch_size > 0
++    
++    processed_results = {}
++    
++    if batching_enabled and processor.require_fwd:
++        # Simply sort all module names and chunk them by batch_size
++        # This processes exactly batch_size MODULES per batch, not batch_size experts
++        sorted_module_names = sorted(subset.keys())
++
++        # Chunk module names directly by batch_size
++        module_chunks = [sorted_module_names[i:i + batch_size] for i in range(0, len(sorted_module_names), batch_size)]
++
++        if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
++            logger.debug(
++                f"MoE Expert Batching Enabled: Processing {len(sorted_module_names)} modules in {len(module_chunks)} batches "
++                f"(batch_size={batch_size} modules per batch)."
++            )
++
++        # Create progress bar for MOE chunks
++        moe_chunk_pb = logger.pb(range(len(module_chunks))).manual()
++        moe_chunk_pb.title(f"MoE Chunk")
++
++        for chunk_idx in moe_chunk_pb:
++            chunk_keys = module_chunks[chunk_idx]
++            # Create subset for this chunk
++            chunk_subset = {k: subset[k] for k in chunk_keys}
++
++            moe_chunk_pb.subtitle(f"({len(chunk_subset)} modules)").draw()
++            if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
++                logger.debug(f"Processing MoE Chunk {chunk_idx+1}/{len(module_chunks)} ({len(chunk_subset)} modules)...")
++
++            # Run pass
++            chunk_result, _ = _run_single_subset_pass(
++                looper=looper,
++                processor=processor,
++                module=module,
++                subset=chunk_subset,
++                layer_inputs=layer_inputs,
++                layer_input_kwargs=layer_input_kwargs,
++                position_ids=position_ids,
++                attention_masks=attention_masks,
++                cur_layer_device=cur_layer_device,
++                is_lm_head_module=is_lm_head_module,
++                layer_descriptor=layer_descriptor,
++                layer_title=layer_title,
++                layer_index=layer_index,
++                subset_index=subset_index,
++                subset_total=subset_total,
++                full=full,
++                failsafe=failsafe,
++                shared_kv_cache_dict=shared_kv_cache_dict,
++                pb=pb,
++                logger=logger,
++                is_awq_processor=is_awq_processor,
++                forward_total_rows=forward_total_rows,
++                forward_row_counts=forward_row_counts,
++                batch_count=batch_count,
++                forward_device_map=forward_device_map,
++                subset_forward_serial=subset_forward_serial,
++                region_timer=region_timer,
++                previous_processed_subset=previous_processed_subset,
++                subset_event_cb=None,
++                return_outputs=False, 
++            )
++            processed_results.update(chunk_result)
++            
++            # Force cleanup between chunks
++            if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
++                 torch_empty_cache()
++
++        # Close MOE chunks progress bar
++        moe_chunk_pb.close()
++
++        # If processor.fwd_after_process is False, stage_layer won't run replay.
++        # But we haven't collected proper full outputs yet (we ignored them or they were partial).
++        # So we MUST run a replay here to get valid layer_inputs for the next layer.
++        if not processor.fwd_after_process:
++             # Final Replay to collect layer outputs
++             _, new_layer_inputs = _run_single_subset_pass(
++                looper=looper,
++                processor=processor,
++                module=module,
++                subset={}, # Empty subset prevents quantization/hooks
++                layer_inputs=layer_inputs,
++                layer_input_kwargs=layer_input_kwargs,
++                position_ids=position_ids,
++                attention_masks=attention_masks,
++                cur_layer_device=cur_layer_device,
++                is_lm_head_module=is_lm_head_module,
++                layer_descriptor=layer_descriptor,
++                layer_title=layer_title,
++                layer_index=layer_index,
++                subset_index=subset_index,
++                subset_total=subset_total,
++                full=full,
++                failsafe=failsafe,
++                shared_kv_cache_dict=shared_kv_cache_dict,
++                pb=pb,
++                logger=logger,
++                is_awq_processor=is_awq_processor,
++                forward_total_rows=forward_total_rows,
++                forward_row_counts=forward_row_counts,
++                batch_count=batch_count,
++                forward_device_map=forward_device_map,
++                subset_forward_serial=subset_forward_serial,
++                region_timer=region_timer,
++                previous_processed_subset=previous_processed_subset,
++                subset_event_cb=None,
++                return_outputs=True,
++                disable_moe_hooks=True,
++            )
++             if new_layer_inputs is not None:
++                 layer_inputs = new_layer_inputs
++    
++    elif processor.require_fwd:
++        # Single pass
++        processed_results, new_layer_inputs = _run_single_subset_pass(
++            looper=looper,
++            processor=processor,
++            module=module,
++            subset=subset,
++            layer_inputs=layer_inputs,
++            layer_input_kwargs=layer_input_kwargs,
++            position_ids=position_ids,
++            attention_masks=attention_masks,
++            cur_layer_device=cur_layer_device,
++            is_lm_head_module=is_lm_head_module,
++            layer_descriptor=layer_descriptor,
++            layer_title=layer_title,
++            layer_index=layer_index,
++            subset_index=subset_index,
++            subset_total=subset_total,
++            full=full,
++            failsafe=failsafe,
++            shared_kv_cache_dict=shared_kv_cache_dict,
++            pb=pb,
++            logger=logger,
++            is_awq_processor=is_awq_processor,
++            forward_total_rows=forward_total_rows,
++            forward_row_counts=forward_row_counts,
++            batch_count=batch_count,
++            forward_device_map=forward_device_map,
++            subset_forward_serial=subset_forward_serial,
++            region_timer=region_timer,
++            previous_processed_subset=previous_processed_subset,
++            subset_event_cb=subset_event_cb,
++            return_outputs=True,
++        )
++        if new_layer_inputs is not None:
++             layer_inputs = new_layer_inputs
++    else:
++        # No forward required
++        if DEBUG_ON:
++            logger.debug(
++                "StageSubset: processor=%s layer=%s subset=%s/%s skipping forward (require_fwd=False)",
++                processor_name,
++                layer_index,
++                subset_index + 1,
++                subset_total,
++            )
++        emit_subset_event("forward_start")
++        emit_subset_event("forward_end")
++        emit_subset_event("quant_start")
++        emit_subset_event("quant_complete")
+ 
+     context = SubsetForwardContext(
+         subset=subset,
+@@ -567,7 +757,7 @@ def run_subset_stage(
+     )
+ 
+     return SubsetStageResult(
+-        processed_subset=processed_subset,
++        processed_subset=processed_results,
+         layer_inputs=layer_inputs,
+         forward_context=context,
+     )
+diff --git a/gptqmodel/looper/stage_subset_5.7.0.py b/gptqmodel/looper/stage_subset_5.7.0.py
+new file mode 100644
+index 0000000..18b4931
+--- /dev/null
++++ b/gptqmodel/looper/stage_subset_5.7.0.py
+@@ -0,0 +1,573 @@
++# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
++# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
++# SPDX-License-Identifier: Apache-2.0
++# Contact: qubitium@modelcloud.ai, x.com/qubitium
++
++"""Subset-level processing stage extracted from ModuleLooper."""
++
++from __future__ import annotations
++
++import logging
++import math
++import re
++import time
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Callable, Dict, List, Optional
++
++import torch
++
++from .awq_processor import AWQProcessor
++from .qqq_processor import QQQProcessor
++from .. import DEBUG_ON, DEVICE_THREAD_POOL
++from ..looper.gptq_processor import GPTQProcessor
++from ..looper.loop_processor import LoopProcessor
++from ..looper.named_module import NamedModule
++from ..quantization.config import GcMode, VramStrategy
++from ..utils.device import get_device
++from ..utils.logger import setup_logger
++from ..utils.torch import torch_empty_cache, torch_sync
++
++if TYPE_CHECKING:  # pragma: no cover - typing only
++    from .module_looper import ModuleLooper
++
++
++@dataclass
++class SubsetForwardContext:
++    subset: Dict[str, NamedModule]
++    forward_device_map: Dict[str, torch.device]
++    subset_forward_serial: bool
++    subset_total: int
++    subset_index: int
++
++
++@dataclass
++class SubsetStageResult:
++    processed_subset: Dict[str, NamedModule]
++    layer_inputs: List[List[torch.Tensor]]
++    forward_context: Optional[SubsetForwardContext]
++
++
++def run_subset_stage(
++    looper: 'ModuleLooper',
++    *,
++    processor: LoopProcessor,
++    module: torch.nn.Module,
++    layer_inputs: List[List[torch.Tensor]],
++    layer_input_kwargs: List[Dict[str, torch.Tensor]],
++    position_ids: List[torch.Tensor],
++    attention_masks: List[torch.Tensor],
++    cur_layer_device: torch.device,
++    is_lm_head_module: bool,
++    layer_descriptor: str,
++    layer_title: str,
++    layer_index: int,
++    layers_prefix: Optional[str],
++    subset: Dict[str, NamedModule],
++    subset_index: int,
++    subset_total: int,
++    full,
++    failsafe,
++    shared_kv_cache_dict: Dict[int, torch.Tensor],
++    pb,
++    log=None,
++    region_timer=None,
++    previous_processed_subset: Optional[Dict[str, NamedModule]] = None,
++    subset_event_cb: Optional[Callable[..., None]] = None,
++) -> SubsetStageResult:
++    """Process a single subset of modules within the layer quantization loop."""
++    logger = log or setup_logger()
++
++    processor_name = processor.name() if hasattr(processor, "name") else type(processor).__name__
++    processor_name_lower = processor_name.lower()
++    is_awq_processor = processor_name_lower.startswith("awq")
++
++    def emit_subset_event(stage: str) -> None:
++        if subset_event_cb is None:
++            return
++        subset_event_cb(
++            stage=stage,
++            layer_idx=layer_index,
++            subset_index=subset_index,
++            subset_total=subset_total,
++            module_names=list(subset.keys()),
++            processor=processor_name,
++        )
++
++    # TODO FIXME: If a full layer has no module to quantize a simple forward() is enough and output is captured 
++    # to be used as next layer's input. So one pass forward (entire layer simple forward wihout need of dealing 
++    # with subset loops and micro forward loops, just full layer, usally XXXDecodeLayer.forward(). 
++    # So output = current_layer.forward() is enough or sometimes just calling the layer callable like layer() 
++    # which same as layer.forward().
++    #
++    # Assume layer 2 has no modules to quantize. At beginniing loop for layer 2, we have layer_output 
++    # from completed forward_replay() of layer 1. Then pass this to layer 2 (as a whole) as layer_input 
++    # and store ouput, then immediately loop to layer 3 without any further subset work that is only necessary 
++    # if we need to quantize part of a layer.
++    #
++    # if len(subset) == 0:
++    #     if logger.isEnabledFor(logging.DEBUG):
++    #         logger.debug(
++    #             "StageSubset: layer=%s subset=%s/%s processor=%s produced empty subset (names=%s)",
++    #             layer_index,
++    #             subset_index + 1,
++    #             subset_total,
++    #             processor_name,
++    #             subset_names,
++    #         )
++    #     return SubsetStageResult(processed_subset={}, layer_inputs=layer_inputs, forward_context=None)
++
++    if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
++        if is_awq_processor:
++            logger.debug(
++                "StageSubset[awq]: layer=%s subset=%s/%s modules=%s sample=%s",
++                layer_index,
++                subset_index + 1,
++                subset_total,
++                len(subset),
++                list(subset.keys())[:8],
++            )
++        else:
++            logger.debug(
++                "StageSubset: layer=%s subset=%s/%s processor=%s created %s modules (sample=%s)",
++                layer_index,
++                subset_index + 1,
++                subset_total,
++                processor_name,
++                len(subset),
++                list(subset.keys())[:8],
++            )
++
++    moe_group_keys_all: List[str] = []
++    forward_device_map: Dict[str, torch.device] = {}
++    subset_forward_serial = False
++
++    attention_subset = bool(subset) and all(
++        looper._is_attention_module_name(name) for name in subset
++    )
++
++    moe_group_key_by_name: Dict[str, Optional[str]] = {
++        name: looper._extract_moe_group_key(name)
++        for name in subset
++    }
++    moe_module_names = [
++        name for name, group_key in moe_group_key_by_name.items()
++        if group_key is not None
++    ]
++    moe_modules_set = set(moe_module_names)
++    is_moe_subset = len(moe_module_names) >= looper._moe_subset_threshold
++
++    if is_moe_subset:
++        expert_groups: Dict[str, List[str]] = {}
++        combined_names: List[str] = list(subset.keys())
++        if full is not None:
++            for candidate in full.keys():
++                if candidate not in subset:
++                    combined_names.append(candidate)
++
++        for sub_name in combined_names:
++            # Group every expert (including ones outside the current subset) so
++            # load balancing decisions can span the full MoE family.
++            group_key = looper._extract_moe_group_key(sub_name)
++            if group_key is None:
++                continue
++            expert_groups.setdefault(group_key, []).append(sub_name)
++
++        moe_group_keys_all = list(expert_groups.keys())
++
++        for name, named_module in subset.items():
++            setattr(named_module, "moe_enabled", name in moe_modules_set)
++
++        if looper._vram_strategy == VramStrategy.BALANCED:
++            devices = [
++                dev for dev in looper._quant_devices
++                if dev is not None and getattr(dev, "type", None) != "cpu"
++            ]
++            if len(devices) > 1 and expert_groups:
++                assignable_group_keys: List[str] = []
++                for group_key, module_names in expert_groups.items():
++                    suffixes = {name.rsplit(".", 1)[-1] for name in module_names}
++                    # TODO: Need to make this configuratble and not static string based. Some moe use wN naming.
++                    if {"gate_proj", "up_proj"}.issubset(suffixes) or {"w1", "w3"}.issubset(suffixes):
++                        assignable_group_keys.append(group_key)
++
++                if assignable_group_keys:
++                    groups_per_device = max(
++                        math.ceil(len(assignable_group_keys) / len(devices)), 1
++                    )
++                    for group_index, group_key in enumerate(assignable_group_keys):
++                        device_idx = min(group_index // groups_per_device, len(devices) - 1)
++                        target_device = devices[device_idx]
++                        for module_name in expert_groups[group_key]:
++                            forward_device_map[module_name] = target_device
++
++        subset_forward_serial = looper._vram_strategy == VramStrategy.BALANCED
++        if subset_forward_serial:
++            active_group_count = len(moe_group_keys_all)
++            if active_group_count == 0:
++                subset_forward_serial = False
++            elif attention_subset and active_group_count <= looper._moe_subset_threshold:
++                subset_forward_serial = False
++    else:
++        for named_module in subset.values():
++            setattr(named_module, "moe_enabled", False)
++
++    auto_forward_data_parallel = getattr(
++        looper.gptq_model.quantize_config,
++        "auto_forward_data_parallel",
++        True,
++    )
++    subset_forward_serial = subset_forward_serial or not auto_forward_data_parallel
++
++    handle = []
++
++    # some processes are simple and not require forward captures
++    if processor.require_fwd:
++        batch_count = looper._resolve_batch_total(
++            getattr(processor, "num_batches", None),
++            layer_inputs,
++        )
++        forward_row_counts = list(looper._collect_row_counts(layer_inputs))
++        if not forward_row_counts and batch_count > 0:
++            forward_row_counts = [1] * batch_count
++        if len(forward_row_counts) > batch_count:
++            forward_row_counts = forward_row_counts[:batch_count]
++        forward_total_rows = sum(forward_row_counts) if forward_row_counts else batch_count
++        forward_total_rows = max(forward_total_rows, 1)
++        if len(forward_row_counts) < batch_count:
++            forward_row_counts.extend([1] * (batch_count - len(forward_row_counts)))
++
++        subset_size = len(subset)
++
++        # Determine MoE block name for hook selection
++        moe_block_name = None
++        if looper.gptq_model and hasattr(looper.gptq_model, 'moe_lifecycle_hooks'):
++            hooks = looper.gptq_model.moe_lifecycle_hooks
++            if hooks is not None:
++                moe_block = hooks.get_moe_block(module, looper.gptq_model.__class__)
++                if moe_block is not None:
++                    # Get the full name/path of the MoE block
++                    for mod_name, mod in module.named_modules():
++                        if mod is moe_block:
++                            moe_block_name = mod_name
++                            break
++
++        for idx, (name, m) in enumerate(subset.items()):
++            # Register the forward hook that captures activations for quantization.
++            # The final module optionally flips a flag so processors can trigger
++            # once-per-subset logic after the forward pass.
++            is_last = (idx == subset_size - 1)
++            hook_source = getattr(m, "full_name", None)
++            if hook_source is None:
++                hook_source = getattr(m, "name", name)
++            if hook_source is None:
++                hook_source = str(name)
++
++            # Determine if this module is part of MoE block (needs pre-hook to avoid StopForward)
++            is_moe_module = moe_block_name and name.startswith(moe_block_name + ".")
++
++            if hasattr(subset[name], 'forward_hook'):
++                original_hook = processor.pre_process_fwd_hook(name)
++                # Use pre-hook for MoE modules to fire before StopForward
++                if is_moe_module:
++                    subset[name].forward_hook = looper._masked_pre_hook_wrapper(processor, original_hook, hook_source)
++                else:
++                    subset[name].forward_hook = looper._masked_hook_wrapper(processor, original_hook, hook_source)
++                enable_stop = processor.fwd_after_process or getattr(processor, "subset_forward_early_stop", False)
++                if is_last and enable_stop:
++                    subset[name].forward_hook_last = True
++            else:
++                original_hook = processor.pre_process_fwd_hook(name)
++                # Use pre-hook registration for MoE modules
++                if is_moe_module:
++                    handle.append(subset[name].register_forward_hook(
++                        looper._masked_pre_hook_wrapper(processor, original_hook, hook_source)
++                    ))
++                else:
++                    handle.append(subset[name].register_forward_hook(
++                        looper._masked_hook_wrapper(processor, original_hook, hook_source)
++                    ))
++
++        if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
++            if is_awq_processor:
++                logger.debug(
++                    "StageSubset[awq]: layer=%s subset=%s/%s processor=%s registering hooks for %s modules",
++                    layer_index,
++                    subset_index + 1,
++                    subset_total,
++                    len(subset),
++                )
++            else:
++                logger.debug(
++                    "StageSubset: layer=%s subset=%s/%s processor=%s registering hooks for %s modules",
++                    layer_index,
++                    subset_index + 1,
++                    subset_total,
++                    processor_name,
++                    len(subset),
++                )
++
++        emit_subset_event("forward_start")
++
++        fwd_start = time.perf_counter()
++        forward_source = f"{layer_descriptor}:subset{subset_index + 1}/{subset_total}"
++
++        need_outputs = not processor.fwd_after_process
++        reuse_kv = bool(getattr(module, "reuse_kv", False))
++        forward_msg = (
++            "Forward: "
++            f"Layer=`{layer_descriptor}`, subset={subset_index + 1}/{subset_total}, "
++            f"batches={batch_count}"
++        )
++        forward_pb = (
++            logger.pb(range(forward_total_rows))
++               .manual()
++               .set(show_left_steps=False)
++        )
++        forward_pb.title(forward_msg).subtitle(
++            f"Row 0/{forward_total_rows}"
++        ).draw()
++
++        previous_forward_devices: Dict[str, torch.device] = {}
++        preserve_devices = bool(forward_device_map)
++        if forward_device_map:
++            previous_forward_devices = looper._apply_forward_device_overrides(
++                subset,
++                forward_device_map,
++                fallback_modules=full,
++            )
++
++        try:
++            # Set the current subset for MoE lifecycle hooks
++            looper._current_subset = subset
++            forward_outputs = looper._run_forward_batches(
++                module=module,
++                processor=processor,
++                layer_inputs=layer_inputs,
++                layer_input_kwargs=layer_input_kwargs,
++                position_ids=position_ids,
++                attention_masks=attention_masks,
++                cur_layer_device=cur_layer_device,
++                is_lm_head_module=is_lm_head_module,
++                shared_kv_cache_dict=shared_kv_cache_dict,
++                layer_index=layer_index,
++                need_outputs=need_outputs,
++                reuse_kv=reuse_kv,
++                progress_pb=forward_pb,
++                progress_title=forward_msg,
++                progress_stage="Forward",
++                progress_rows_per_batch=forward_row_counts,
++                progress_total_rows=forward_total_rows,
++                force_serial=subset_forward_serial,
++                preserve_module_devices=preserve_devices,
++            )
++        finally:
++            if forward_device_map:
++                looper._restore_forward_device_overrides(
++                    subset,
++                    previous_forward_devices,
++                    fallback_modules=full,
++                )
++            if forward_pb is not None:
++                forward_pb.close()
++        if need_outputs:
++            processor.receive_layer_inputs(forward_outputs)
++            layer_inputs = processor.inputs_cache.layer_inputs
++            del forward_outputs
++        emit_subset_event("forward_end")
++
++        fwd_time = time.perf_counter() - fwd_start
++        processor.set_fwd_time(fwd_time)
++        if region_timer is not None:
++            region_timer.record(
++                "pre_quant_forward",
++                fwd_time,
++                source=forward_source,
++            )
++
++        for h in handle:
++            # Detach temporary hooks to avoid leaking state into future passes.
++            h.remove()
++
++        for name in subset:
++            # Reset inline hook attributes on NamedModule wrappers so future passes
++            # do not reuse state from this subset run.
++            if hasattr(subset[name], 'forward_hook'):
++                subset[name].forward_hook = None
++                subset[name].forward_hook_last = False
++
++        if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
++            torch_sync()
++            torch_empty_cache()
++    else:
++        if DEBUG_ON:
++            logger.debug(
++                "StageSubset: processor=%s layer=%s subset=%s/%s skipping forward (require_fwd=False)",
++                processor_name,
++                layer_index,
++                subset_index + 1,
++                subset_total,
++            )
++        emit_subset_event("forward_start")
++        emit_subset_event("forward_end")
++
++    moe_skip_modules = []
++    failsafe_enabled = failsafe is not None
++    if isinstance(processor, GPTQProcessor) or isinstance(processor, QQQProcessor) or isinstance(processor, AWQProcessor):
++        for name in subset:
++            # Skip MoE experts that never fired; they likely lacked calibration
++            # traffic and would produce invalid statistics.
++            if not processor.has_captured_input_ids(name):
++                # only log for moe if `failsafe` is not enabled
++                if not failsafe_enabled:
++                    logger.error(
++                        f"`{name}` was not invoked, if it is a MoE module, it may lack sufficient calibration data routed to it. "
++                        f"Please enable and use `failsafe` config option."
++                    )
++                moe_skip_modules.append(name)
++
++        if not failsafe_enabled:
++            for name in moe_skip_modules:
++                skipped_module = subset.pop(name)
++                task_map = getattr(processor, "tasks", None)
++                if task_map is not None:
++                    task_map.pop(name, None)
++
++                # No calibration data was routed to these MoE expert modules.
++                # We skip quantization them and record them in `qcfg.dynamic` as dynamically excluded modules.
++                if processor.qcfg.dynamic is None:
++                    processor.qcfg.dynamic = {}
++                processor.qcfg.dynamic[f"-:{re.escape(skipped_module.full_name)}"] = {}
++
++    quant_target_devices: Dict[str, torch.device] = {}
++    for name, named_module in subset.items():
++        # Ensure each module has a matching processor task before sending it to
++        # the worker pool; otherwise freeze it on the current device.
++        task_map = getattr(processor, "tasks", None)
++        has_task = bool(task_map and task_map.get(name) is not None)
++
++        if has_task:
++            target_device = looper._prepare_named_module_for_quantization(
++                processor=processor,
++                named_module=named_module,
++                fallback_device=cur_layer_device,
++            )
++        else:
++            target_device = get_device(named_module.module)
++            setattr(named_module, "target_device", target_device)
++            setattr(named_module.module, "target_device", target_device)
++
++        quant_target_devices[name] = target_device
++
++    processed_subset: Dict[str, NamedModule] = {}
++    futures = []
++
++    emit_subset_event("quant_start")
++
++    @torch.inference_mode()
++    def _process_on_worker(
++        proc: LoopProcessor,
++        nm: NamedModule,
++        expected_device: torch.device,
++        subset_ref: Dict[str, NamedModule],
++        previous_subset_ref: Optional[Dict[str, NamedModule]],
++        subset_idx: int,
++        subset_total_count: int,
++    ):
++        module_label = getattr(nm, "full_name", getattr(nm, "name", repr(nm)))
++        proc_name = proc.name() if hasattr(proc, "name") else type(proc).__name__
++        module_ref = nm.module if isinstance(nm, NamedModule) else nm
++        module_weight = getattr(module_ref, "weight", None)
++        if module_weight is not None and expected_device is not None:
++            target_device = expected_device if isinstance(expected_device, torch.device) else torch.device(expected_device)
++            actual_device = get_device(module_weight)
++            assert actual_device == target_device, (
++                f"Device mismatch for '{module_label}' process task: "
++                f"module weight on {actual_device}, thread target {target_device}."
++            )
++
++        timer = getattr(looper.gptq_model, "quant_region_timer", None)
++        start = time.perf_counter() if timer else None
++        try:
++            if DEBUG_ON and logger.isEnabledFor(logging.DEBUG):
++                if is_awq_processor:
++                    logger.debug(
++                        "StageSubsetWorker[awq]: layer=%s subset=%s/%s module=%s previous_subset=%s",
++                        getattr(nm, "layer_index", None),
++                        subset_idx + 1,
++                        subset_total_count,
++                        module_label,
++                        bool(previous_subset_ref),
++                    )
++                else:
++                    logger.debug(
++                        "StageSubsetWorker: processor=%s layer=%s subset=%s/%s module=%s running on %s (previous_subset=%s)",
++                        proc_name,
++                        getattr(nm, "layer_index", None),
++                        subset_idx + 1,
++                        subset_total_count,
++                        module_label,
++                        expected_device,
++                        bool(previous_subset_ref),
++                    )
++            proc.process(
++                module=nm,
++                subset=subset_ref,
++                previous_subset=previous_subset_ref,
++                subset_index=subset_idx,
++                subset_total=subset_total_count,
++            )
++        finally:
++            if timer is not None and start is not None:
++                timer.record(
++                    "process_quant",
++                    time.perf_counter() - start,
++                    source=module_label,
++                )
++        return nm.name, nm
++
++    for name, named_module in subset.items():
++        # Launch processing for every module in the subset; tasks may run in
++        # parallel as allowed by the device thread pool.
++        tgt_dev = quant_target_devices.get(name, cur_layer_device)
++        futures.append(
++            DEVICE_THREAD_POOL.submit(
++                tgt_dev,
++                _process_on_worker,
++                processor,
++                named_module,
++                tgt_dev,
++                subset,
++                previous_processed_subset,
++                subset_index,
++                subset_total,
++            )
++        )
++
++    for fut in futures:
++        # Collect results in submission order so the final subset map preserves
++        # deterministic iteration for downstream consumers.
++        name, named_module = fut.result()
++        if isinstance(named_module, NamedModule) and named_module.state.get("capture_only"):
++            # Capture-only modules should not be finalized or offloaded.
++            continue
++        processed_subset[name] = named_module
++    torch_sync()
++
++    if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
++        torch_empty_cache()
++
++    emit_subset_event("quant_complete")
++
++    context = SubsetForwardContext(
++        subset=subset,
++        forward_device_map=forward_device_map,
++        subset_forward_serial=subset_forward_serial,
++        subset_total=subset_total,
++        subset_index=subset_index,
++    )
++
++    return SubsetStageResult(
++        processed_subset=processed_subset,
++        layer_inputs=layer_inputs,
++        forward_context=context,
++    )
+diff --git a/gptqmodel/models/auto.py b/gptqmodel/models/auto.py
+index 9df6f6e..e58878f 100644
+--- a/gptqmodel/models/auto.py
++++ b/gptqmodel/models/auto.py
+@@ -59,8 +59,10 @@ from typing import Any, Dict, List, Optional, Type, Union  # noqa: E402
+ import numpy  # noqa: E402
+ import torch  # noqa: E402
+ from huggingface_hub import list_repo_files  # noqa: E402
++from packaging.version import Version  # noqa: E402
+ from tokenicer import Tokenicer  # noqa: E402
+ from transformers import AutoConfig, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase  # noqa: E402
++from transformers import __version__ as TRANSFORMERS_VERSION
+ 
+ from ..adapter.adapter import Adapter, Lora, normalize_adapter  # noqa: E402
+ from ..nn_modules.qlinear.torch import TorchQuantLinear  # noqa: E402
+@@ -87,8 +89,8 @@ from .definitions.dots1 import Dots1QModel  # noqa: E402
+ from .definitions.dream import DreamQModel  # noqa: E402
+ from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
+ from .definitions.ernie4_5_moe import Ernie4_5_MoeQModel  # noqa: E402
+-from .definitions.exaone4 import Exaone4QModel  # noqa: E402
+ from .definitions.exaone import ExaOneQModel  # noqa: E402
++from .definitions.exaone4 import Exaone4QModel  # noqa: E402
+ from .definitions.falcon_h1 import FalconH1QModel  # noqa: E402
+ from .definitions.gemma2 import Gemma2QModel  # noqa: E402
+ from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3QModel  # noqa: E402
+@@ -109,6 +111,7 @@ from .definitions.internlm import InternLMQModel  # noqa: E402
+ from .definitions.internlm2 import InternLM2QModel  # noqa: E402
+ from .definitions.klear import KlearQModel  # noqa: E402
+ from .definitions.lfm2_moe import LFM2MoeQModel  # noqa: E402
++# from .definitions.llada2 import LLaDA2MoeQModel
+ from .definitions.llama import LlamaQModel  # noqa: E402
+ from .definitions.llama4 import Llama4QModel  # noqa: E402
+ from .definitions.llava_qwen2 import LlavaQwen2QModel  # noqa: E402
+@@ -149,6 +152,15 @@ from .definitions.voxtral import VoxtralGPTQ  # noqa: E402
+ from .definitions.xverse import XverseQModel  # noqa: E402
+ 
+ 
++TRANSFORMERS_SUPPORTS_QWEN3_5 = Version(TRANSFORMERS_VERSION) >= Version("5.2.0")
++if TRANSFORMERS_SUPPORTS_QWEN3_5:
++    from .definitions.qwen3_5 import Qwen3_5QModel  # noqa: E402
++    from .definitions.qwen3_5_moe import Qwen3_5_MoeQModel  # noqa: E402
++else:
++    Qwen3_5QModel = None
++    Qwen3_5_MoeQModel = None
++
++
+ # make quants and inference more determinisitc
+ torch.manual_seed(787)
+ random.seed(787)
+@@ -251,11 +263,19 @@ MODEL_MAP = {
+     "nemotron_h": NemotronHQModel,
+     "bailing_moe": BailingMoeQModel,
+     "lfm2_moe": LFM2MoeQModel,
++    # "llada2_moe": LLaDA2MoeQModel,
+     "mistral3": Mistral3GPTQ,
+     "afmoe": AfMoeQModel,
+     "voxtral": VoxtralGPTQ,
+ }
+ 
++if Qwen3_5QModel is not None:
++    MODEL_MAP["qwen3_5"] = Qwen3_5QModel
++    MODEL_MAP["qwen3_5_text"] = Qwen3_5QModel
++
++if Qwen3_5_MoeQModel is not None:
++    MODEL_MAP["qwen3_5_moe"] = Qwen3_5_MoeQModel
++
+ SUPPORTED_MODELS = list(MODEL_MAP.keys())
+ 
+ 
+diff --git a/gptqmodel/models/base.py b/gptqmodel/models/base.py
+index 7d16f5a..4a676b6 100644
+--- a/gptqmodel/models/base.py
++++ b/gptqmodel/models/base.py
+@@ -43,7 +43,7 @@ from ..nn_modules.qlinear.lookahead import configure_default_lookahead
+ from ..nn_modules.qlinear.torch import TorchQuantLinear
+ from ..quantization import QuantizeConfig
+ from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, GcMode, VramStrategy, dynamic_get
+-from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model
++from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, reset_ln
+ from ..utils.backend import BACKEND
+ from ..utils.calibration import prepare_calibration_dataset
+ from ..utils.device import get_device
+@@ -141,6 +141,8 @@ log = setup_logger()
+ class BaseQModel(nn.Module):
+     # name of lm_head
+     lm_head: str = "lm_head"
++    # Special rotary_emb path
++    rotary_embedding: str | None = None
+ 
+     # a tree node of all the roots that contain quantizable modules
+     module_tree: List[str] = None
+@@ -179,6 +181,11 @@ class BaseQModel(nn.Module):
+     # some models require a different model loader, such as mllama which uses AutoModelForPreTraining
+     loader = AutoModelForCausalLM
+ 
++    # Some models have multiple configurations.
++    # For example, in llama4 and qwen3_5, model_class.form_config requires TextConfig.
++    config_class = None
++
++
+     # monkey patch api for trust_remote_code=True models that have broken transformer compat
+     require_monkeypatch = False
+ 
+@@ -267,6 +274,11 @@ class BaseQModel(nn.Module):
+ 
+         if tokenizer is not None:
+             if isinstance(tokenizer, PreTrainedTokenizerBase):
++                # ====== 【for qwen3.5 MoE】：prevent lack token_id, incur tokenicer breakdown ======
++                for token_attr in ["bos_token_id", "eos_token_id", "pad_token_id"]:
++                    if not hasattr(model.config, token_attr):
++                        setattr(model.config, token_attr, None)
++                ###
+                 self.tokenizer = Tokenicer.load(tokenizer, trust_remote_code=trust_remote_code)
+             else:
+                 raise ValueError(
+@@ -544,7 +556,7 @@ class BaseQModel(nn.Module):
+             [name for name in block if NOT_QUANTIZE_FLAG not in name]
+             for block in layer_modules
+         ]
+-        layer_modules = [block for block in layer_modules if block]  # 去掉空 block
++        layer_modules = [block for block in layer_modules if block]  # discard block
+ 
+         if getattr(quantize_config, "dynamic", None):
+             new_layer_modules = []
+@@ -763,16 +775,20 @@ class BaseQModel(nn.Module):
+ 
+             module_name_args = {
+                 "layers_node": self.extract_layers_node(),
+-                "lm_head_name": self.lm_head
++                "lm_head_name": self.lm_head,
++                "pre_lm_head_norm_module_name": self.pre_lm_head_norm_module # <-- new
+             }
+-            self.model = fuse_layer_norms(model=self.model,
+-                                            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+-                                            **module_name_args)
++            # self.model = fuse_layer_norms(model=self.model,
++            #                                 pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
++            #                                 **module_name_args)
+ 
+             # MPS does not support float64.
+             rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
+-            self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
++
++            # ___self._rotation_Q, self.model._rotation_Q for bpdq
++            self.model, self.model._rotation_Q = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
+                                             device=rotation_device, **module_name_args)
++            # self._rotation_device = rotation_device  
+ 
+         # init processor with default GPTQ processor
+         from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor
+@@ -854,6 +870,7 @@ class BaseQModel(nn.Module):
+                 failsafe=self.quantize_config.failsafe,
+             )
+ 
++
+         timer = getattr(self, "quant_region_timer", None)
+         if timer is not None:
+             timer.flush()
+@@ -1843,7 +1860,8 @@ class BaseQModel(nn.Module):
+     def _auto_detect_module_tree(self, model: PreTrainedModel, quant_method: METHOD):
+         log.warn("Model not yet support, attempting Module Tree AutoCompat...")
+ 
+-        if quant_method != METHOD.GPTQ:
++        if quant_method not in [METHOD.GPTQ, METHOD.BPDQ]:
++        # if quant_method != METHOD.GPTQ:
+             log.warn(f"Module Tree AutoCompat: Failed, quant_method={quant_method}, only support GPTQ")
+             return None
+ 
+diff --git a/gptqmodel/models/definitions/base_qwen3_vl.py b/gptqmodel/models/definitions/base_qwen3_vl.py
+index ae413d6..d469cf4 100644
+--- a/gptqmodel/models/definitions/base_qwen3_vl.py
++++ b/gptqmodel/models/definitions/base_qwen3_vl.py
+@@ -3,8 +3,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # Contact: qubitium@modelcloud.ai, x.com/qubitium
+ 
+-from typing import Dict, Optional
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
++import torch
+ from PIL import Image
+ from transformers import AutoModelForImageTextToText, AutoProcessor, ProcessorMixin
+ 
+@@ -16,6 +17,21 @@ from .._const import CPU
+ from ..base import BaseQModel
+ 
+ 
++QWEN_VL_UTILS_INSTALL_HINT = (
++    "qwen_vl_utils is required for Qwen3-VL video inputs. "
++    "Install it with `pip install qwen-vl-utils`."
++)
++
++
++def _load_fetch_video():
++    try:
++        from qwen_vl_utils.vision_process import fetch_video
++    except ImportError as exc:
++        raise ImportError(QWEN_VL_UTILS_INSTALL_HINT) from exc
++
++    return fetch_video
++
++
+ class BaseQwen3VLGPTQ(BaseQModel):
+     loader = AutoModelForImageTextToText
+ 
+@@ -65,19 +81,52 @@ class BaseQwen3VLGPTQ(BaseQModel):
+ 
+     @staticmethod
+     def process_vision_info(
+-            conversations: list[dict] | list[list[dict]],
+-    ) -> Optional[list[Image.Image]]:
++        conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
++        return_video_kwargs: bool = False,
++        return_video_metadata: bool = False,
++        image_patch_size: int = 14,
++    ) -> Tuple[
++        Optional[List[Image.Image]],
++        Optional[List[Union[torch.Tensor, List[Image.Image]]]],
++        Optional[Dict[str, Any]],
++    ]:
++
+         vision_infos = extract_vision_info(conversations)
+-        # Read images
++        ## Read images or videos
+         image_inputs = []
++        video_inputs = []
++        video_sample_fps_list = []
++        fetch_video = None
+         for vision_info in vision_infos:
+             if "image" in vision_info or "image_url" in vision_info:
+-                image_inputs.append(fetch_image(vision_info))
++                image_inputs.append(
++                    fetch_image(vision_info, image_patch_size=image_patch_size)
++                )
++            elif "video" in vision_info:
++                if fetch_video is None:
++                    fetch_video = _load_fetch_video()
++                video_input, video_sample_fps = fetch_video(
++                    vision_info,
++                    return_video_sample_fps=True,
++                    image_patch_size=image_patch_size,
++                    return_video_metadata=return_video_metadata,
++                )
++                video_sample_fps_list.append(video_sample_fps)
++                video_inputs.append(video_input)
+             else:
+-                raise ValueError("image, image_url should in content.")
++                raise ValueError("image, image_url or video should in content.")
+         if len(image_inputs) == 0:
+             image_inputs = None
+-        return image_inputs
++        if len(video_inputs) == 0:
++            video_inputs = None
++
++        video_kwargs = {"do_sample_frames": False}
++        if not return_video_metadata:  # BC for qwen2.5vl
++            video_kwargs.update({"fps": video_sample_fps_list})
++
++        if return_video_kwargs:
++            return image_inputs, video_inputs, video_kwargs
++        return image_inputs, video_inputs
+ 
+     def preprocess_dataset(self, sample: Dict) -> Dict:
+         return sample
+@@ -92,11 +141,11 @@ class BaseQwen3VLGPTQ(BaseQModel):
+             text = processor.apply_chat_template(
+                 batch, tokenize=False, add_generation_prompt=True
+             )
+-            image_inputs = self.process_vision_info(batch)
++            image_inputs, video_inputs = self.process_vision_info(batch)
+             inputs = processor(
+                 text=text,
+                 images=image_inputs,
+-                videos=None,
++                videos=video_inputs,
+                 padding=True,
+                 return_tensors="pt",
+             )
+diff --git a/gptqmodel/models/definitions/base_qwen3_vl_5.7.0.py b/gptqmodel/models/definitions/base_qwen3_vl_5.7.0.py
+new file mode 100644
+index 0000000..ae413d6
+--- /dev/null
++++ b/gptqmodel/models/definitions/base_qwen3_vl_5.7.0.py
+@@ -0,0 +1,105 @@
++# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
++# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
++# SPDX-License-Identifier: Apache-2.0
++# Contact: qubitium@modelcloud.ai, x.com/qubitium
++
++from typing import Dict, Optional
++
++from PIL import Image
++from transformers import AutoModelForImageTextToText, AutoProcessor, ProcessorMixin
++
++from ...utils.calibration import batched
++from ...utils.image import extract_vision_info, fetch_image
++from ...utils.model import MODALITY, move_to
++from ...utils.offload import offload_to_disk
++from .._const import CPU
++from ..base import BaseQModel
++
++
++class BaseQwen3VLGPTQ(BaseQModel):
++    loader = AutoModelForImageTextToText
++
++    pre_lm_head_norm_module = "model.norm"
++
++    module_tree = [
++        "model",
++        "language_model",
++        "layers",
++        "#",
++        {
++            "input_layernorm": ("input_layernorm:!",),
++            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1", "q_norm:!", "k_norm:!"),
++            "post_attention_layernorm": ("post_attention_layernorm:!",),
++            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
++        }
++    ]
++
++    modality = [MODALITY.TEXT, MODALITY.IMAGE_TO_TEXT]
++
++    require_load_processor = True
++
++    def pre_quantize_generate_hook_start(self):
++        self.model.language_model.embed_tokens = move_to(self.model.language_model.embed_tokens, device=self.quantize_config.device)
++        self.model.language_model.rotary_emb = move_to(self.model.language_model.rotary_emb, device=self.quantize_config.device)
++        self.model.visual = move_to(self.model.visual, device=self.quantize_config.device)
++
++    def pre_quantize_generate_hook_end(self):
++        if self.quantize_config.offload_to_disk:
++            offload_to_disk(model=self.model.language_model,
++                            module=self.model.language_model.embed_tokens,
++                            disk_path=self.quantize_config.offload_to_disk_path,
++                            )
++            offload_to_disk(model=self.model.language_model,
++                            module=self.model.language_model.rotary_emb,
++                            disk_path=self.quantize_config.offload_to_disk_path,
++                            )
++            offload_to_disk(model=self.model,
++                            module=self.model.visual,
++                            disk_path=self.quantize_config.offload_to_disk_path,
++                            )
++            return
++
++        self.model.language_model.embed_tokens = move_to(self.model.language_model.embed_tokens, device=CPU)
++        self.model.language_model.rotary_emb = move_to(self.model.language_model.rotary_emb, device=CPU)
++        self.model.visual = move_to(self.model.visual, device=CPU)
++
++    @staticmethod
++    def process_vision_info(
++            conversations: list[dict] | list[list[dict]],
++    ) -> Optional[list[Image.Image]]:
++        vision_infos = extract_vision_info(conversations)
++        # Read images
++        image_inputs = []
++        for vision_info in vision_infos:
++            if "image" in vision_info or "image_url" in vision_info:
++                image_inputs.append(fetch_image(vision_info))
++            else:
++                raise ValueError("image, image_url should in content.")
++        if len(image_inputs) == 0:
++            image_inputs = None
++        return image_inputs
++
++    def preprocess_dataset(self, sample: Dict) -> Dict:
++        return sample
++
++    def load_processor(self) -> ProcessorMixin:
++        return AutoProcessor.from_pretrained(self.model_local_path)
++
++    def prepare_dataset(self, calibration_dataset, batch_size: int = 1, **kwargs):
++        processor = self.load_processor()
++        calib_data = []
++        for batch in batched(calibration_dataset, batch_size, process_func=self.preprocess_dataset):
++            text = processor.apply_chat_template(
++                batch, tokenize=False, add_generation_prompt=True
++            )
++            image_inputs = self.process_vision_info(batch)
++            inputs = processor(
++                text=text,
++                images=image_inputs,
++                videos=None,
++                padding=True,
++                return_tensors="pt",
++            )
++            calib_data.append(inputs)
++        del processor
++        return calib_data
+diff --git a/gptqmodel/models/definitions/gpt_oss.py b/gptqmodel/models/definitions/gpt_oss.py
+index a8061da..1f28c56 100644
+--- a/gptqmodel/models/definitions/gpt_oss.py
++++ b/gptqmodel/models/definitions/gpt_oss.py
+@@ -50,25 +50,61 @@ class GptOssExpertsNew(nn.Module):
+                     tgt_d_b.copy_(d_b_src)
+ 
+     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
++        orig_shape = hidden_states.shape
++
++        if routing_weights is not None and routing_weights.dim() == 3:
++            routing_weights = routing_weights.reshape(-1, routing_weights.shape[-1])
++        if router_indices is not None and router_indices.dim() == 3:
++            router_indices = router_indices.reshape(-1, router_indices.shape[-1])
++        # ============================================
++        # if self.quantizing:
++        #     # For quantization, we need to trigger computation of all experts
++        #     batch_size = hidden_states.shape[0]
++        #     hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
++        #     num_experts = routing_weights.shape[1]
++
++        #     hidden_states = hidden_states.repeat(num_experts, 1)
++        #     hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)
++        #     gate_up = torch.stack([proj(hidden_states[i]) for i, proj in enumerate(self.gate_up)])
++        #     gate, up = gate_up[..., ::2], gate_up[..., 1::2]
++        #     gate = gate.clamp(min=None, max=self.limit)
++        #     up = up.clamp(min=-self.limit, max=self.limit)
++        #     glu = gate * torch.sigmoid(gate * self.alpha)
++        #     next_states = torch.stack([proj((up[i] + 1) * glu[i]) for i, proj in enumerate(self.down)])
++        #     next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
++        #     next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
++        #     next_states = next_states.sum(dim=0)
++
++        #     return next_states
++
+         if self.quantizing:
+             # For quantization, we need to trigger computation of all experts
+-            batch_size = hidden_states.shape[0]
+-            hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
++            total_tokens = hidden_states.numel() // self.hidden_size
++            hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (total_tokens, hidden_size)
+             num_experts = routing_weights.shape[1]
+ 
+             hidden_states = hidden_states.repeat(num_experts, 1)
+             hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)
++            
+             gate_up = torch.stack([proj(hidden_states[i]) for i, proj in enumerate(self.gate_up)])
+             gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+             gate = gate.clamp(min=None, max=self.limit)
+             up = up.clamp(min=-self.limit, max=self.limit)
+             glu = gate * torch.sigmoid(gate * self.alpha)
++            
+             next_states = torch.stack([proj((up[i] + 1) * glu[i]) for i, proj in enumerate(self.down)])
+-            next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
+-            next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
++            
++            next_states = next_states.view(num_experts, total_tokens, self.hidden_size)
++            
++            weights_transposed = routing_weights.transpose(0, 1).unsqueeze(-1) # (num_experts, total_tokens, 1)
++            next_states = next_states * weights_transposed
++            
+             next_states = next_states.sum(dim=0)
++            
++            return next_states.reshape(orig_shape)
++        
+ 
+-            return next_states
++        
+ 
+         # For non-quantization forward pass, reduce forward pass time by only computing active experts
+         batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1] if len(hidden_states.shape) > 2 else 1
+@@ -123,7 +159,8 @@ class GptOssTopKRouterNew(nn.Module):
+         router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+         router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+         router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+-        return router_scores, router_indices
++        # return router_scores, router_indices
++        return router_logits, router_scores, router_indices ###
+ 
+ class GPTOSSGPTQ(BaseQModel):
+     dynamic_expert_index = "num_local_experts"
+diff --git a/gptqmodel/models/definitions/qwen3_5.py b/gptqmodel/models/definitions/qwen3_5.py
+new file mode 100644
+index 0000000..71a782e
+--- /dev/null
++++ b/gptqmodel/models/definitions/qwen3_5.py
+@@ -0,0 +1,37 @@
++# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
++# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
++# SPDX-License-Identifier: Apache-2.0
++# Contact: qubitium@modelcloud.ai, x.com/qubitium
++from transformers.models.qwen3_5 import Qwen3_5TextConfig
++
++from . import LlamaQModel
++
++
++class Qwen3_5QModel(LlamaQModel):
++    """
++    Qwen3_5 inherits the Llama-style layout but inserts Q/K RMS norm layers
++    ahead of the attention projections. We mark those helper modules as
++    non-quantized so the layer walker captures the complete structure.
++    """
++
++    config_class = Qwen3_5TextConfig
++
++    layer_modules_strict = False
++
++    module_tree = [
++        "model",
++        "layers",
++        "#",
++        {
++            "input_layernorm": ("input_layernorm:!",),
++            "self_attn": ("q_norm:!", "q_proj:0", "k_norm:!", "k_proj:0", "v_proj:0", "o_proj:1"),
++            "linear_attn": (
++                "norm:!",
++                "in_proj_qkv:0",
++                "in_proj_z:1",
++                "out_proj:2",
++            ),
++            "post_attention_layernorm": ("post_attention_layernorm:!",),
++            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
++        },
++    ]
+diff --git a/gptqmodel/models/definitions/qwen3_5_moe.py b/gptqmodel/models/definitions/qwen3_5_moe.py
+new file mode 100644
+index 0000000..4d45eda
+--- /dev/null
++++ b/gptqmodel/models/definitions/qwen3_5_moe.py
+@@ -0,0 +1,58 @@
++# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
++# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
++# SPDX-License-Identifier: Apache-2.0
++# Contact: qubitium@modelcloud.ai, x.com/qubitium
++from transformers.models.auto import AutoModelForImageTextToText
++
++from gptqmodel.models.moe_lifecycle import GateUpDownMoELifecycleHooks
++
++from ..base import BaseQModel
++
++
++class Qwen3_5_MoeQModel(BaseQModel):
++    loader = AutoModelForImageTextToText
++
++    layer_modules_strict = False
++
++    require_monkeypatch = False
++
++    # allow dynamic expert index for layer_modules so we don't need to write out 64 layers here
++    # config.num_experts contains the actual expert count used for index
++    dynamic_expert_index = "num_experts"
++
++    pre_lm_head_norm_module = "model.language_model.norm"
++
++    rotary_embedding = "model.language_model.rotary_emb"
++
++    # awq scaling optimizations requires some modules within same subset to strictly match the shape of previous module
++    # the o_proj must match v_proj or else scaling optimizations are skipped (GQA vs MHA)
++    awq_scale_optimize_shape_dependent_modules = ["self_attn.o_proj"]
++
++    # MoE lifecycle hooks for gate_proj/up_proj/down_proj pattern
++    moe_lifecycle_hooks = GateUpDownMoELifecycleHooks()
++
++
++    module_tree = [
++        "model",
++        "language_model",
++        "layers",
++        "#",
++        {
++            "input_layernorm": ("input_layernorm:!",),
++            "self_attn": ("norm:!", "q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
++            "linear_attn": (
++                "norm:!",
++                "in_proj_qkv:0",
++                "in_proj_z:1",
++                "out_proj:2",
++            ),
++            "post_attention_layernorm": ("post_attention_layernorm:!",),
++            "mlp:moe:?": {
++                "gate": ("gate:!",),  # <-- 0.5MB per layer. Not worth quantizing
++                "experts": {
++                    "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
++                },
++                "shared_experts": ("gate_proj:0", "up_proj:0", "down_proj:1"),
++            },
++        }
++    ]
+diff --git a/gptqmodel/models/loader.py b/gptqmodel/models/loader.py
+index 23a7217..5de6bce 100644
+--- a/gptqmodel/models/loader.py
++++ b/gptqmodel/models/loader.py
+@@ -23,6 +23,8 @@ if ensure_modelscope_available():
+ else:
+     from huggingface_hub import snapshot_download
+ 
++
++import defuser ###
+ from packaging.version import InvalidVersion, Version
+ from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
+ from transformers.utils import is_flash_attn_2_available
+@@ -156,6 +158,11 @@ def ModelLoader(cls):
+ 
+         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_id_or_path, trust_remote_code=trust_remote_code)
+ 
++        # Some models have multiple configurations.
++        # For example, in llama4 and qwen3_5, model_class.form_config requires TextConfig.
++        if cls.config_class is not None and cls.config_class == config.sub_configs.get("text_config", None):
++            config = config.get_text_config()###
++
+         if quantize_config is None:
+             model_init_kwargs["device_map"] =device_map if device_map else "auto"
+             model_init_kwargs["dtype"] = dtype
+@@ -242,6 +249,7 @@ def ModelLoader(cls):
+ 
+         if quantize_config.offload_to_disk:
+             model = build_shell_model(cls.loader, config=config, **model_init_kwargs)
++            defuser.convert_model(model, cleanup_original=False)###
+             model._model_init_kwargs = model_init_kwargs
+             print_module_tree(model=model)
+ 
+@@ -264,6 +272,7 @@ def ModelLoader(cls):
+         else:
+             print("loading model directly to CPU (not using meta device or turtle_model)-----------")
+             model = cls.loader.from_pretrained(model_local_path, config=config, **model_init_kwargs)
++            defuser.convert_model(model, cleanup_original=False) ###
+             model._model_init_kwargs = model_init_kwargs
+             print_module_tree(model=model)
+ 
+@@ -536,27 +545,42 @@ def ModelLoader(cls):
+                     args = {ATTN_IMPLEMENTATION: "flash_attention_2"}
+                     log.info("Loader: Auto enabling flash attention2")
+ 
++            # Some models have multiple configurations.
++            # For example, in llama4 and qwen3_5, model_class.form_config requires TextConfig.
++            if cls.config_class == config.sub_configs.get("text_config", None):
++                config = config.get_text_config()
++            ###
++
+             model = cls.loader.from_config(
+                 config, trust_remote_code=trust_remote_code, dtype=dtype, **args
+             )
++            defuser.convert_model(model, cleanup_original=True)###
+             model.checkpoint_file_name = model_save_name
++            extract_layers_node = cls.extract_layers_node()###
+ 
++            
+             # Get the first layer to determine layer type
+-            layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node())
+-
+-            layers[0]
++            # layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node()) 5.7.0
++            ###
++            layers, _ = get_module_by_name_prefix(model, extract_layers_node) ###
++            # layers[0] 5.7.0
+ 
+             modules = find_modules(model)
+             ignore_modules = [cls.lm_head] + cls.get_base_modules(model)
+ 
++            simple_layer_modules = cls.simple_layer_modules(config, qcfg) ###
+             for name in list(modules.keys()):
+                 # allow loading of quantized lm_head
+                 if qcfg.lm_head and name == cls.lm_head:
+                     continue
+ 
+-                if not any(name.startswith(prefix) for prefix in cls.extract_layers_node()) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
+-                        not name.endswith(ignore_module) for sublist in cls.simple_layer_modules(config, qcfg) for ignore_module in sublist
+-                ):
++                # if not any(name.startswith(prefix) for prefix in cls.extract_layers_node()) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
++                #         not name.endswith(ignore_module) for sublist in cls.simple_layer_modules(config, qcfg) for ignore_module in sublist
++                # ):
++                ###
++                if not any(name.startswith(prefix) for prefix in extract_layers_node) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
++                        not name.endswith(ignore_module) for sublist in simple_layer_modules for ignore_module in sublist
++                ):###
+                     # log non-lm-head quantized modules only
+                     if name is not cls.lm_head:
+                         log.info(f"The layer {name} is not quantized.")
+@@ -765,7 +789,8 @@ def ModelLoader(cls):
+             return device_map
+ 
+         log.info(f"Loader: device = {device}")
+-        layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node())
++        # layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node()) 5.7.0
++        # layers, _ = get_module_by_name_prefix(model, extract_layers_node)
+         num_gpus = 1
+         if device is DEVICE.CUDA:
+             num_gpus = torch.cuda.device_count()
+diff --git a/gptqmodel/nn_modules/converter.py b/gptqmodel/nn_modules/converter.py
+index b1c952f..b66eed0 100644
+--- a/gptqmodel/nn_modules/converter.py
++++ b/gptqmodel/nn_modules/converter.py
+@@ -20,7 +20,21 @@ def convert_gpt_oss_expert_converter(module, config):
+             self.experts = experts_new
+ 
+         def forward(self, hidden_states):
+-            router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
++
++            # router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
++            
++            ### oss
++            router_outputs = self.router(hidden_states)
++
++            if isinstance(router_outputs, tuple):
++                if len(router_outputs) == 2:
++                    router_scores, router_indices = router_outputs[0], router_outputs[1]
++                elif len(router_outputs) >= 3:
++                    router_scores, router_indices = router_outputs[0], router_outputs[1]
++                        
++            
++            
++            
+             routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
+             return routed_out, router_scores
+ 
+diff --git a/gptqmodel/nn_modules/qlinear/__init__.py b/gptqmodel/nn_modules/qlinear/__init__.py
+index 9cb7a38..b4162ef 100644
+--- a/gptqmodel/nn_modules/qlinear/__init__.py
++++ b/gptqmodel/nn_modules/qlinear/__init__.py
+@@ -23,6 +23,7 @@ from ...utils.backend import BACKEND
+ from ...utils.env import env_flag
+ from ...utils.logger import setup_logger
+ from ...utils.safe import THREADPOOLCTL
++# from .bpdq_torch import BPDQTorchLinear
+ 
+ 
+ log = setup_logger()
+diff --git a/gptqmodel/nn_modules/qlinear/bpdq_torch.py b/gptqmodel/nn_modules/qlinear/bpdq_torch.py
+new file mode 100644
+index 0000000..c018272
+--- /dev/null
++++ b/gptqmodel/nn_modules/qlinear/bpdq_torch.py
+@@ -0,0 +1,390 @@
++# gptqmodel/nn_modules/qlinear/bpdq_torch.py
++
++import math
++import torch
++import torch.nn as nn
++from typing import List
++
++from . import BaseQuantLinear
++from ...models._const import DEVICE, PLATFORM
++from ...quantization.config import FORMAT, METHOD
++from ...utils.backend import BACKEND
++from ...adapter.adapter import Adapter
++
++
++# import importlib.util
++# import sys
++# so_path = "path/GPTQModel/lut_gemm_ext.cpython-312-x86_64-linux-gnu.so"
++# spec = importlib.util.spec_from_file_location("lut_gemm_ext", so_path)
++# if spec and spec.loader:
++#     lut_gemm_ext = importlib.util.module_from_spec(spec)
++#     sys.modules["lut_gemm_ext"] = lut_gemm_ext
++#     spec.loader.exec_module(lut_gemm_ext)
++# Please ref LUT-GEMM: https://arxiv.org/abs/2206.09557
++
++
++import triton
++import triton.language as tl
++_TORCH_TO_TRITON_DTYPE = {
++    torch.float16:  tl.float16,
++    torch.bfloat16: tl.bfloat16,
++}
++@triton.autotune(
++    configs=[
++        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
++        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64}, num_warps=4, num_stages=3),
++        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64}, num_warps=2, num_stages=2),
++    ],
++    key=['M', 'N', 'K'],
++)
++@triton.jit
++def bpdq_kernel_v21(
++    # Pointers
++    x_ptr, B_ptr, alpha_ptr, bias_ptr, out_ptr, Linear_bias_ptr,
++    # Shapes
++    M, N, K,
++    # Strides
++    stride_xm, stride_xk,
++    stride_bk, stride_bb, stride_bn,
++    stride_ag, stride_ab, stride_an,
++    stride_bg, stride_bn_bias,
++    stride_om, stride_on, stride_ob,
++    # Meta-parameters
++    BLOCK_M:         tl.constexpr,
++    BLOCK_N:         tl.constexpr,
++    BLOCK_K:         tl.constexpr,   # == GROUP_SIZE
++    N_PLANES:        tl.constexpr,
++    HAS_LINEAR_BIAS: tl.constexpr,
++    OUTPUT_DTYPE:    tl.constexpr,
++):
++    tl.static_assert(BLOCK_K % 32 == 0, "BLOCK_K must be divisible by 32")
++
++    # pid / grid swizzle
++    pid = tl.program_id(axis=0)
++
++    num_pid_m = tl.cdiv(M, BLOCK_M)
++    num_pid_n = tl.cdiv(N, BLOCK_N)
++    GROUP_M   = 8
++    num_pid_in_group = GROUP_M * num_pid_n
++
++    group_id     = pid // num_pid_in_group
++    first_pid_m  = group_id * GROUP_M
++    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
++
++    pid_in_group = pid % num_pid_in_group
++    pid_m = first_pid_m + (pid_in_group % group_size_m)
++    pid_n = pid_in_group // group_size_m
++
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M]
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # [BLOCK_N]
++    valid_m = offs_m < M
++    valid_n = offs_n < N
++
++    # FP32
++    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++
++    x_ptr_base = x_ptr + offs_m[:, None].to(tl.int64) * stride_xm  # [BLOCK_M, 1]
++    bn      = offs_n.to(tl.int64) * stride_bn       # [BLOCK_N]  B 
++    an      = offs_n.to(tl.int64) * stride_an       # [BLOCK_N]  alpha 
++    bn_bias = offs_n.to(tl.int64) * stride_bn_bias  # [BLOCK_N]  bias 
++
++    shift_vals = tl.arange(0, 32)[:, None]          # [32, 1]
++    k_offsets  = tl.arange(0, 32)[None, :]          # [1, 32]
++
++    for k_block_start in range(0, K, BLOCK_K):
++        g = k_block_start // BLOCK_K  
++
++        bias_val = tl.load(bias_ptr + g * stride_bg + bn_bias, mask=valid_n, other=0.0).to(tl.float32)
++
++        if N_PLANES >= 1:
++            a0 = tl.load(alpha_ptr + g * stride_ag + 0 * stride_ab + an, mask=valid_n, other=0.0).to(tl.float32)
++        if N_PLANES >= 2:
++            a1 = tl.load(alpha_ptr + g * stride_ag + 1 * stride_ab + an, mask=valid_n, other=0.0).to(tl.float32)
++        if N_PLANES >= 3:
++            a2 = tl.load(alpha_ptr + g * stride_ag + 2 * stride_ab + an, mask=valid_n, other=0.0).to(tl.float32)
++        if N_PLANES >= 4:
++            a3 = tl.load(alpha_ptr + g * stride_ag + 3 * stride_ab + an, mask=valid_n, other=0.0).to(tl.float32)
++
++        k_tile_base = k_block_start // 32 
++
++        for t in tl.static_range(0, BLOCK_K // 32):
++            k_tile  = k_tile_base + t
++            k_start = k_block_start + t * 32
++
++            k_range = (k_start + k_offsets).to(tl.int64)             # [1, 32]
++            x_chunk = tl.load(x_ptr_base + k_range * stride_xk, mask=valid_m[:, None], other=0.0)       # [BLOCK_M, 32]
++
++            w = tl.zeros((32, BLOCK_N), dtype=tl.float32)            # [32, BLOCK_N]
++
++            if N_PLANES >= 1:
++                p0 = tl.load(B_ptr + k_tile * stride_bk + 0 * stride_bb + bn, mask=valid_n, other=0)    # [BLOCK_N] int32
++                w += ((p0[None, :] >> shift_vals) & 1).to(tl.float32) * a0[None, :]
++
++            if N_PLANES >= 2:
++                p1 = tl.load(B_ptr + k_tile * stride_bk + 1 * stride_bb + bn, mask=valid_n, other=0)
++                w += ((p1[None, :] >> shift_vals) & 1).to(tl.float32) * a1[None, :]
++
++            if N_PLANES >= 3:
++                p2 = tl.load(B_ptr + k_tile * stride_bk + 2 * stride_bb + bn, mask=valid_n, other=0)
++                w += ((p2[None, :] >> shift_vals) & 1).to(tl.float32) * a2[None, :]
++
++            if N_PLANES >= 4:
++                p3 = tl.load(B_ptr + k_tile * stride_bk + 3 * stride_bb + bn, mask=valid_n, other=0)
++                w += ((p3[None, :] >> shift_vals) & 1).to(tl.float32) * a3[None, :]
++
++            w += bias_val[None, :]         # [32, BLOCK_N] fp32
++
++            accumulator = tl.dot(
++                x_chunk,                   # [BLOCK_M, 32]  bf16
++                w.to(OUTPUT_DTYPE),        # [32, BLOCK_N]  bf16
++                acc=accumulator,           # [BLOCK_M, BLOCK_N] fp32，
++            )
++
++    # Linear bias
++    if HAS_LINEAR_BIAS:
++        out_b = tl.load(Linear_bias_ptr + offs_n.to(tl.int64) * stride_ob, mask=valid_n, other=0.0).to(tl.float32)
++        accumulator += out_b[None, :]
++
++    out_ptrs = (out_ptr + offs_m[:, None].to(tl.int64) * stride_om + offs_n[None, :].to(tl.int64) * stride_on)
++    tl.store(out_ptrs, accumulator.to(OUTPUT_DTYPE), mask=valid_m[:, None] & valid_n[None, :],)
++
++
++
++class BPDQTorchLinear(BaseQuantLinear):
++    SUPPORTS_BACKENDS = [BACKEND.TORCH]
++    SUPPORTS_METHODS = [METHOD.BPDQ]            # Corresponds to METHOD.BPDQ in config.py
++    SUPPORTS_FORMATS = {FORMAT.BPDQ: 10}        # Corresponds to FORMAT.BPDQ in config.py
++    
++    SUPPORTS_BITS = [2, 3, 4, 6, 8, 10, 12, 14, 16]
++    SUPPORTS_GROUP_SIZE = [32, 64, 128, 256] 
++    SUPPORTS_DESC_ACT = [False]
++    SUPPORTS_SYM = [True, False]
++    SUPPORTS_SHARDS = True
++    SUPPORTS_TRAINING = False
++    SUPPORTS_AUTO_PADDING = False
++    SUPPORTS_IN_FEATURES_DIVISIBLE_BY = [32]    # Required by BPDQ LUT-GEMM
++    SUPPORTS_OUT_FEATURES_DIVISIBLE_BY = [1]
++    SUPPORTS_DEVICES = [DEVICE.ALL]
++    SUPPORTS_PLATFORM = [PLATFORM.ALL]
++    SUPPORTS_PACK_DTYPES = [torch.int32]     
++    SUPPORTS_ADAPTERS = [] 
++    SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
++    
++    REQUIRES_FORMAT_V2 = False
++    QUANT_TYPE = "bpdq"
++
++    def __init__(self, bits: int, group_size: int, sym: bool, desc_act: bool, in_features: int, out_features: int, 
++                    bias: bool = False, pack_dtype: torch.dtype = torch.int32, c_type = torch.bfloat16, adapter: Adapter = None, register_buffers: bool = True, **kwargs,):
++        self.msbits = kwargs.get("msbits", 4)
++        self.c_type = c_type 
++        # super().__init__(register_buffers=False skips the parent class's default GPTQ buffer registration
++        super().__init__(bits=bits, group_size=group_size, sym=sym, desc_act=desc_act, in_features=in_features, out_features=out_features, 
++                            bias=bias, pack_dtype=pack_dtype, backend=kwargs.pop("backend", BACKEND.TORCH), adapter=adapter, register_buffers=False, **kwargs)
++        
++        if register_buffers:    # Only register BPDQ-specific buffers (c, B, bias)
++            k = self.msbits
++            num_column_groups = math.ceil(self.in_features / self.group_size)
++            c_shape = (num_column_groups, k + 1, self.out_features)
++            in_feat_padded = self.in_features
++            if self.group_size == 256 and (in_feat_padded % 256 != 0):
++                in_feat_padded = ((in_feat_padded + 256 - 1) // 256) * 256 
++            b_shape = (in_feat_padded // 32, k, self.out_features)
++
++            # Visible to writer.py for direct Safetensors export! NOTE: c_type defaults to bf16
++            self.register_buffer("c", torch.zeros(c_shape, dtype=self.c_type))
++            self.register_buffer("B", torch.zeros(b_shape, dtype=torch.int32))
++            
++            if bias:
++                self.register_buffer("bias", torch.zeros(self.out_features, dtype=self.c_type))
++            else:
++                self.bias = None
++
++
++    # Override list_buffers for device offloading and fetching
++    def list_buffers(self) -> List:
++        buf = []
++        if hasattr(self, "c") and self.c is not None:
++            buf.append(self.c)
++        if hasattr(self, "B") and self.B is not None:
++            buf.append(self.B)
++        if hasattr(self, "bias") and self.bias is not None:
++            buf.append(self.bias)
++        return buf
++
++
++    # Minimal pack interface to receive the processor's payload
++    def pack(self, linear: nn.Module, c: torch.Tensor = None, B: torch.Tensor = None, **kwargs):
++        """ Receives c and B matrices from the quantization loop and registers them as buffers."""
++        if c is not None and B is not None:
++            self.register_buffer("c", c)  # Saved using the model's actual dtype; inference ideally uses external args (defaults to c_type = torch.bfloat16)
++            self.register_buffer("B", B)
++
++        if getattr(linear, "bias", None) is not None:
++            b = linear.bias.detach().to(device="cpu", dtype=self.c_type).contiguous()
++            self.register_buffer("bias", b)
++            # if isinstance(getattr(self, "_buffers", None), dict) and isinstance(self._buffers.get("bias", None), torch.Tensor):
++            #     self._buffers["bias"].copy_(b)
++            # else:
++            #     self.register_buffer("bias", b)
++        else:
++            if isinstance(getattr(self, "_buffers", None), dict):
++                self._buffers.pop("bias", None)
++            self.bias = None
++
++
++    # Hide BPDQ pack/unpack logic internally
++    def _unpack_lutgemm_int32(self, packed_int32: torch.Tensor, original_k: int):
++        K_tiles, Bits, M = packed_int32.shape
++        shifts = torch.arange(32, device=packed_int32.device, dtype=torch.int32).view(1, 1, 1, 32)
++        packed_expanded = packed_int32.unsqueeze(-1)
++        unpacked_bits = (packed_expanded >> shifts) & 1         # [K_tiles, Bits, M, 32]
++
++        # Target: [Bits, M, K_tiles, 32] -> [Bits, M, Total_K]
++        unpacked_permuted = unpacked_bits.permute(1, 2, 0, 3)
++        
++        B_restored = unpacked_permuted.contiguous().reshape(Bits, M, K_tiles * 32)
++        if B_restored.shape[2] > original_k:
++            B_restored = B_restored[:, :, :original_k]
++            
++        return B_restored 
++
++
++    def _forward_python_ref(self, x_in):
++        K_eff = x_in.shape[1] 
++        B_unpacked  = self._unpack_lutgemm_int32(self.B, K_eff).to(x_in.dtype)                          # [Bits, M, K_eff]
++        alpha       = self._lut_alpha.to(x_in.dtype)                                                    # [Groups, Bits, M]
++        bplane_bias = self._lut_bias.to(x_in.dtype)                                                     # [Groups, M]
++
++        col_group       = torch.arange(K_eff, device=x_in.device, dtype=torch.long) // self.group_size  # [K_eff]
++        alpha_k         = alpha.index_select(0, col_group).permute(1, 2, 0).contiguous()                # [Bits, M, K_eff]
++        bplane_bias_k   = bplane_bias.index_select(0, col_group).t().contiguous()                       # [M, K_eff]
++
++        W_recon = (B_unpacked.float() * alpha_k.float()).sum(dim=0) + bplane_bias_k.float()             # [M, K_eff]
++        out = x_in.float().matmul(W_recon.t())
++        if getattr(self, "bias", None) is not None:
++            out = out + self.bias.to(device=out.device, dtype=out.dtype) 
++        return out.to(x_in.dtype)
++
++
++    def forward(self, x: torch.Tensor):
++        out_shape = x.shape[:-1] + (self.out_features,)
++        x = x.reshape(-1, x.shape[-1])
++
++
++        ref_flag = False 
++
++
++        if hasattr(self, "B") and self.B.dtype == torch.int32:
++            input_dtype = x.dtype
++            if input_dtype != self.c_type:
++                x_in = x.to(self.c_type).contiguous()
++            else:
++                x_in = x.contiguous()
++
++            cache_key = (self.c.device, self.c.dtype)
++            if getattr(self, "_lut_cache_key", None) != cache_key:
++                self._lut_alpha = self.c[:, :-1, :].contiguous()
++                self._lut_bias  = self.c[:, -1,  :].contiguous()
++                raw_bias = getattr(self, "bias", None)
++                if raw_bias is not None:
++                    self._cached_linear_bias = raw_bias.contiguous()
++                    self._cached_ob_stride   = self._cached_linear_bias.stride(0)
++                else:
++                    self._cached_linear_bias = None
++                    self._cached_ob_stride   = 0
++                self._lut_cache_key = cache_key
++
++
++            total_tokens = x_in.shape[0]
++            if False: # LUT-GEMM Kernel
++            # if total_tokens == 1: 
++                M, K = x_in.shape
++                # assert K % self.group_size == 0, f"K {K} must be divisible by group_size {self.group_size}"
++                # assert self.group_size % 32 == 0
++
++                # args = [x_in,               # x
++                #     self.B,                 # B
++                #     self._lut_alpha,        # alpha
++                #     self._lut_bias,         # quant bias
++                #     self.group_size,        # group_size
++                #     self.bpdq_k_bits,       # num_bits
++                #     0,                      # m_tile_size (0=Auto)
++                #     0                       # num_threads (0=Auto)
++                # ]
++                # if self._cached_linear_bias is not None:
++                #     args.append(self._cached_linear_bias)
++                # out_fp32 = lut_gemm_ext.forward(*args)
++                # out = out_fp32.to(x_in.dtype)
++            else:     
++                M, K = x_in.shape
++                _, _, N = self.B.shape
++
++                assert K % self.group_size == 0, f"K={K} must be divisible by group_size={self.group_size}"
++                assert K % 32 == 0, "K must be divisible by 32 (bit-tile requirement)"
++
++                out = torch.empty((M, N), device=x_in.device, dtype=self.c_type)
++                has_linear_bias = (self._cached_linear_bias is not None)
++                stride_ob       = self._cached_ob_stride
++                linear_bias = self._cached_linear_bias if has_linear_bias else out
++                grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
++                output_dtype_tl = _TORCH_TO_TRITON_DTYPE[self.c_type]
++
++                bpdq_kernel_v21[grid](
++                    # Pointers
++                    x_in, self.B, self._lut_alpha, self._lut_bias, out, linear_bias,
++                    # Shapes
++                    M, N, K,
++                    # Strides
++                    x_in.stride(0), x_in.stride(1),
++                    self.B.stride(0), self.B.stride(1), self.B.stride(2),
++                    self._lut_alpha.stride(0), self._lut_alpha.stride(1), self._lut_alpha.stride(2),
++                    self._lut_bias.stride(0),  self._lut_bias.stride(1),
++                    out.stride(0), out.stride(1), stride_ob,
++                    BLOCK_K=self.group_size,                # GROUP_SIZE
++                    N_PLANES=self.msbits,
++                    HAS_LINEAR_BIAS=has_linear_bias,
++                    OUTPUT_DTYPE=output_dtype_tl
++                )
++
++
++            if ref_flag and hasattr(self, "_forward_python_ref"):
++                name = getattr(self, "name", self.__class__.__name__)
++                out_ref = self._forward_python_ref(x_in)
++                out_f = out.float()
++                ref_f = out_ref.float()
++                diff = (out_f - ref_f).abs()
++
++                same_inf = torch.isinf(out_f) & torch.isinf(ref_f) & (torch.sign(out_f) == torch.sign(ref_f))
++                diff = diff.masked_fill(same_inf, 0.0)
++
++                nan_in  = torch.isnan(x_in).any().item()
++                inf_in  = torch.isinf(x_in).any().item()
++                nan_out = torch.isnan(out).any().item()
++                inf_out = torch.isinf(out).any().item()
++                nan_ref = torch.isnan(out_ref).any().item()
++                inf_ref = torch.isinf(out_ref).any().item()
++                if nan_in or inf_in or nan_out or inf_out or nan_ref or inf_ref:
++                    print(f"[{name}] NON-FINITE ||in(nan={nan_in},inf={inf_in}) ||out(nan={nan_out},inf={inf_out}) ||ref(nan={nan_ref},inf={inf_ref})"
++                          f"max|in|={x_in.abs().max().item():.3e}|| max|out|={out.abs().max().item():.3e}|| max|ref|={out_ref.abs().max().item():.3e}")
++
++                # nan-safe mean/max
++                diff_f = diff.float()
++                mask = ~torch.isnan(diff_f)
++                if mask.any():
++                    mean_diff = diff_f[mask].mean().item()
++                    max_diff  = diff_f[mask].max().item()
++                else:
++                    mean_diff = float("nan")
++                    max_diff  = float("nan")
++                status = "✅ MATCH" if (mean_diff == mean_diff and mean_diff < 1e-2) else "⚠️  MISMATCH"
++                print(f"[{name}] tk={x_in.shape[0]} | MeanDiff: {mean_diff:.5f} MaxDiff: {max_diff:.5f} {status}")
++
++            if input_dtype != self.c_type:
++                out = out.to(input_dtype)   
++        else:
++            out = self._forward(x, out_shape)
++
++        return out.reshape(out_shape)
++    
++
+diff --git a/gptqmodel/nn_modules/qlinear/gemm_awq.py b/gptqmodel/nn_modules/qlinear/gemm_awq.py
+index 4b40d41..c28b84b 100644
+--- a/gptqmodel/nn_modules/qlinear/gemm_awq.py
++++ b/gptqmodel/nn_modules/qlinear/gemm_awq.py
+@@ -87,7 +87,7 @@ class AwqGEMMQuantLinear(AWQuantLinear):
+     SUPPORTS_BACKENDS = [BACKEND.GEMM]
+     SUPPORTS_METHODS = [METHOD.AWQ]
+     SUPPORTS_FORMATS = {FORMAT.GEMM: 60}
+-    SUPPORTS_BITS = [4]
++    SUPPORTS_BITS = [4,3,2]
+     SUPPORTS_GROUP_SIZE = [-1, 16, 32, 64, 128]
+     SUPPORTS_DESC_ACT = [True, False]
+     SUPPORTS_SYM = [True, False]
+diff --git a/gptqmodel/nn_modules/qlinear/torch_awq.py b/gptqmodel/nn_modules/qlinear/torch_awq.py
+index 15748c7..1d9f60e 100644
+--- a/gptqmodel/nn_modules/qlinear/torch_awq.py
++++ b/gptqmodel/nn_modules/qlinear/torch_awq.py
+@@ -21,7 +21,7 @@ class AwqTorchQuantLinear(AWQuantLinear):
+     SUPPORTS_BACKENDS = [BACKEND.TORCH_AWQ]
+     SUPPORTS_METHODS = [METHOD.AWQ]
+     SUPPORTS_FORMATS = {FORMAT.GEMM: 10}
+-    SUPPORTS_BITS = [4]
++    SUPPORTS_BITS = [4,3,2]
+     SUPPORTS_GROUP_SIZE = [-1, 16, 32, 64, 128]
+     SUPPORTS_DESC_ACT = [True, False]
+     SUPPORTS_SYM = [True, False]
+diff --git a/gptqmodel/quantization/bpdq.py b/gptqmodel/quantization/bpdq.py
+new file mode 100644
+index 0000000..6254aab
+--- /dev/null
++++ b/gptqmodel/quantization/bpdq.py
+@@ -0,0 +1,418 @@
++# gptqmodel/quantization/bpdq.py
++
++import math
++import time
++import threading
++import torch
++import torch.nn as nn
++import transformers
++
++from .gptq import GPTQ
++from .quantizer import Quantizer
++from ..utils.logger import setup_logger
++from .gar import compute_local_perms, compute_global_perm, compose_final_perm, invert_perm
++
++log = setup_logger()
++
++
++def analysis_diff(original, approximation):
++    original_f = original.float()
++    approximation_f = approximation.float()
++    norm_original = torch.linalg.norm(original_f)
++    if norm_original == 0:
++        return 0.0
++    norm_diff = torch.linalg.norm(original_f - approximation_f)
++    rel_err_x_vs_wq = (norm_diff / norm_original).item()
++    return rel_err_x_vs_wq
++
++
++class BPDQuantizer(Quantizer):
++
++    def bit_plane_decomposition(self, q, bits: int):
++        w_int = q.to(torch.int32)
++        planes = [((w_int >> i) & 1).to(torch.uint8) for i in range(bits)]
++        return torch.stack(planes, dim=0)  # [bits, B, G] uint8
++
++    def solve_C(self, W_target, basis_plane, U_loc, num_plane, alpha=1e-4, dtype_store=torch.float32, dtype_acc=torch.float32):
++        device = W_target.device
++        B, group_size = W_target.shape                                                 
++        n_features = num_plane + 1                                                           # k bit-planes + 1 bias term
++        ones_batched = torch.ones(B, group_size, 1, device=device, dtype=dtype_acc)          # Constant feature for bias (c0)
++        I = torch.eye(n_features, device=device, dtype=dtype_acc).expand(B, n_features, n_features)
++
++        # --- bit-planes (B), solve for coefficients (C) ---
++        b_stacked_u8 = basis_plane.permute(1, 2, 0)                                          # [B, group_size, num_plane]
++        X_batched = torch.cat((b_stacked_u8.to(dtype=dtype_acc), ones_batched), dim=2)       # [B, group_size, n_features]
++
++        U = U_loc.to(dtype=dtype_acc)   # Upper triangular Cholesky factor of the local inverse Hessian (Group)
++
++        # Pre-whiten X and Y using U^{-T} (avoids explicit matrix inversion)
++        # Pre-whiten X: Reshape to [G, B*n] for a single batched solve to avoid Python loops
++        X_rhs = X_batched.permute(1, 0, 2).reshape(group_size, B * n_features).contiguous()  # [G, B*n]
++        Xp_flat = torch.linalg.solve_triangular(U.transpose(0, 1), X_rhs, upper=False)       # solve(U^T, ·)
++        Xp = Xp_flat.reshape(group_size, B, n_features).permute(1, 0, 2).contiguous()        # [B,G,n]
++
++        # Pre-whiten Y (Target Weights)
++        Y_rhs = W_target.to(dtype_acc).transpose(0, 1).contiguous()                          # [G,B]
++        Yp_T = torch.linalg.solve_triangular(U.transpose(0, 1), Y_rhs, upper=False)          # [G,B]
++        Yp = Yp_T.transpose(0, 1).contiguous()   
++
++        XT = Xp.transpose(1, 2)     
++        XTX = XT @ Xp 
++        A = XTX + I * float(alpha)    
++        rhs = XT @ Yp.unsqueeze(-1)
++
++        # solve -> (fail row) lstsq
++        # current_C_fp32 = torch.linalg.solve(A, rhs)                # [B, n_features, 1]
++        sol, info = torch.linalg.solve_ex(A, rhs)                    # info == 0 means successful solve
++        if torch.any(info != 0):                     
++            bad = (info != 0)                                        # [B]
++            sol_bad = torch.linalg.lstsq(A[bad], rhs[bad]).solution  # Fallback to robust least squares (SVD/QR) for singular matrices
++            sol[bad] = sol_bad                                        
++        if not torch.isfinite(sol).all():
++            raise ValueError("Non-finite values (NaN or Inf) detected in solution C")
++
++        # NOTE Keep for reference
++        # error_groupwise_coeffs = analysis_diff(W_target, (X_batched @ sol).squeeze(-1))
++        # print(f"*BPD-ALS (k={num_plane})* init error: {error_groupwise_coeffs:.6f}")
++        
++        return sol.to(dtype_store)
++
++        # # ___ Improves ACC, but PPL higher ___
++        # diag_mean = XTX.diagonal(dim1=-2, dim2=-1).mean(dim=-1)
++        # diag_mean = diag_mean.clamp(min=1e-8)                           
++        # alpha_eff = (float(alpha) * diag_mean).view(-1, 1, 1)
++        # A = XTX + I * alpha_eff
++        # rhs = XT @ Yp.unsqueeze(-1)
++        # sol, info = torch.linalg.solve_ex(A, rhs)
++        # if torch.any(info != 0):
++        #     bad = (info != 0)
++        #     if bad.any():
++        #         sol_bad = torch.linalg.lstsq(A[bad], rhs[bad]).solution
++        #         sol[bad] = sol_bad
++        # if not torch.isfinite(sol).all():
++        #     raise ValueError("Non-finite values (NaN or Inf) detected in solution C")
++        # return sol.to(dtype_store)
++
++
++    def quantize_bpdq(
++        self,
++        W_target,   # shape [rows, G]
++        scales,     # match W_target shape, dims*batch, batch=group_size. (identical values per group/row)
++        zeros,      # match W_target shape
++
++        W_process, U_rows, U_loc, d_loc,
++
++        bplane_bits=8, msb_num=4, alpha=1e-4,
++        n_iters=5, candidate_vectors=None, candidate_vectors_float=None, 
++        dtype_store=torch.float32, dtype_acc=torch.float32
++    ):
++        # pid = os.getpid()
++        # tid = threading.get_ident()
++        device = W_target.device
++        rows, G = W_target.shape
++        tail_len = W_process.shape[1]
++
++        q = torch.clamp(torch.round(W_target / scales) + zeros, 0, 2**bplane_bits - 1)
++        # all_planes: [BITS, B, group_size]
++        all_planes = self.bit_plane_decomposition(q, bplane_bits) 
++        start_bit_index = bplane_bits - msb_num
++
++        c_store_iter = self.solve_C(W_target, all_planes[start_bit_index:], U_loc, 
++                                    num_plane=msb_num, alpha=alpha, dtype_store=dtype_store, dtype_acc=dtype_acc)
++        
++
++        # base W_process snapshot (avoid iterations wrong.)
++        base_processing = W_process.to(dtype_acc).contiguous()
++
++        results = None
++        results_score = torch.tensor(float("inf"), device=device, dtype=dtype_acc)
++        for it in range(n_iters):
++            # restore W_processing to same start
++            W_processing = base_processing.clone()
++
++            # 1) build v_cands (float) from c
++            C_coeffs = c_store_iter[:, :-1, 0].to(dtype_acc).contiguous()                   # [rows, k]
++            C_bias   = c_store_iter[:,  -1, 0].to(dtype_acc).contiguous()                   # [rows]
++            v_cands  = C_coeffs.matmul(candidate_vectors_float.t()) + C_bias.unsqueeze(1)   # [rows, ncand]
++
++            # 2) GPTQ-style, propagation on tail
++            k = msb_num
++            B_final = torch.empty((k, rows, G), device=device, dtype=torch.uint8)
++            Q_old   = torch.empty((rows, G), device=device, dtype=dtype_acc)                # quantized weight
++            E_old   = torch.empty((rows, G), device=device, dtype=dtype_acc)
++
++            for t in range(G):
++                y_col = W_processing[:, t]                                  # [rows]
++
++                diff = y_col.unsqueeze(1) - v_cands                         # [rows, ncand]
++                best_idx = diff.pow(2).argmin(dim=1)                        # [rows]
++
++                best_b = candidate_vectors[best_idx]                        # [rows, k]
++                B_final[:, :, t] = best_b.transpose(0, 1).contiguous()
++
++                q_col = v_cands.gather(1, best_idx.view(-1, 1)).squeeze(1)  # [rows]
++                Q_old[:, t] = q_col
++
++                err = (y_col - q_col) / d_loc[t]                            # Eq. (3)
++                E_old[:, t] = err
++
++                # propagate to tail: W_processing[:, t:] -= err * U_rows[t, t:]
++                U_seg = U_rows[t, t:tail_len].to(dtype_acc)                 # [tail_len - t]
++                W_processing[:, t:tail_len] = W_processing[:, t:tail_len] - err.unsqueeze(1) * U_seg.unsqueeze(0)
++
++                # keep exact q at position t
++                # W_processing[:, t] = q_col  # redundancy
++
++            # 3) refit c under U_loc metric with fixed B_final (prewhiten LS)
++            c_store = self.solve_C(W_target, B_final, U_loc, msb_num, alpha, dtype_store, dtype_acc)
++
++            # rebuild Q_new using inference-equivalent c_store
++            b_stacked = B_final.permute(1, 2, 0).to(dtype_acc)        # [rows, G, k]
++            ones = torch.ones(rows, G, 1, device=device, dtype=dtype_acc)
++            X = torch.cat([b_stacked, ones], dim=2)                   # [rows, G, k+1]
++            Q_new = (X @ c_store.to(dtype_acc)).squeeze(-1)           # [rows, G]
++
++            # delta-correction: ΔS U_loc = Q_old - Q_new
++            D = (Q_old - Q_new)                                       # [rows, G]
++
++            # Eq. (9) delta_E*U_{loc}=W_{old}-W_{new}
++            delta_E_T = torch.linalg.solve_triangular(U_loc.transpose(0, 1).to(dtype_acc), D.transpose(0, 1).contiguous(),upper=False,)
++            delta_E = delta_E_T.transpose(0, 1).contiguous()          # [rows, G]
++
++            # update E_group and tail to match new Q
++            E_new = E_old + delta_E                                   # Delta Correction
++
++            # overwrite group with Q_new (final)
++            W_processing[:, :G] = Q_new
++
++            # correct tail beyond group: W_processing[:, G:] -= ΔS @ U_rows[:, G:]
++            if tail_len > G:
++                W_processing[:, G:tail_len] = W_processing[:, G:tail_len] - delta_E.matmul(U_rows[:, G:tail_len].to(dtype_acc))
++
++            # "retaining the iterate that minimizes the group-wise propagation error ||E_{:,s:(s+g)}||.
++            # the reconstruct ERROR in Hessian
++            score = E_new.pow(2).sum()  # score by ||S_g||^2
++
++            if (results is None) or (score < results_score):  # solve_C → B-step → refit → delta
++                results_score = score
++                results = dict(W_processing=W_processing, Q_store=Q_new.to(dtype_store), E_group=E_new, B_final=B_final.clone(), c_store=c_store.clone())
++                # print(f"[pid={pid}|tid={tid}] iter={it+1}/{n_iters}||results_score={results_score.detach().item():.6e}")
++
++            # iterate c <- refit(c)
++            c_store_iter = c_store
++
++        return results
++
++
++
++class BPDQ(GPTQ):
++    def __init__(self, module: nn.Module, qcfg=None):
++        super().__init__(module, qcfg)
++        self._bpdq_candidate_cache = {}
++
++
++    def create_quantizer(self, name: str) -> Quantizer:
++        return BPDQuantizer(qcfg=self.qcfg, name=name)
++
++
++    def _get_bpdq_candidates(self, k: int, dtype: torch.dtype, device: torch.device):
++        if k <= 0:
++            return None, None
++        key = (int(k), dtype, device)
++        cached = self._bpdq_candidate_cache.get(key, None)
++        if cached is not None:
++            return cached
++
++        values = torch.tensor([0, 1], device=device, dtype=torch.uint8)
++        if k == 1:
++            candidate_vectors = values.view(-1, 1)
++        else:
++            candidate_vectors = torch.cartesian_prod(*([values] * k))
++
++        candidate_vectors_float = candidate_vectors.to(dtype=dtype)
++        self._bpdq_candidate_cache[key] = (candidate_vectors, candidate_vectors_float)
++        return candidate_vectors, candidate_vectors_float
++        # candidate_vectors (uint8) for fast storage, candidate_vectors_f (float) for matmul.
++
++
++    @torch.inference_mode()
++    def _pack_lutgemm_int32(self, B_batch: torch.Tensor):
++        Bits, M, GroupSize = B_batch.shape
++        if GroupSize % 32 != 0:
++            raise ValueError(f"LUT-GEMM requires GroupSize multiple of 32, got {GroupSize}")
++        B_int = B_batch.to(torch.int32).contiguous()                # .round().clamp(0, 1) maybe redundancy
++        B_reshaped = B_int.reshape(Bits, M, GroupSize // 32, 32)
++        B_permuted = B_reshaped.permute(2, 0, 1, 3)                 # [Bits, M, G_blocks, 32] -> [G_blocks, Bits, M, 32]
++        shifts = torch.arange(32, device=B_batch.device, dtype=torch.int32).view(1, 1, 1, 32)
++        packed_int32 = (B_permuted << shifts).sum(dim=-1, dtype=torch.int32)
++        return packed_int32.contiguous()
++
++
++    @torch.inference_mode()
++    def quantize(self, blocksize=128):
++        start = time.time()
++        target_device = getattr(self.module, "target_device", None)
++
++        assert self.qcfg.bpdq is not None, "BPDQConfig is required for BPDQ quantization."
++        assert self.qcfg.group_size in (32, 64, 128, 256), "BPDQ scheme requires group_size in {32, 64, 128, 256}."
++        assert self.columns % self.qcfg.group_size == 0, "columns must be multiple of group_size for BPDQ."
++        msb_num = self.qcfg.bpdq.msbits
++        n_iters = self.qcfg.bpdq.n_iters
++        alpha = self.qcfg.bpdq.alpha
++        group_size = self.qcfg.group_size
++        if blocksize < group_size:
++            blocksize = group_size   
++        is_rotated = (getattr(self.qcfg, "rotation", None) is not None)
++
++
++        self.finalize_hessian(target_device=target_device)
++        if self.module_copy is None:
++            W = self.clone_module(device=target_device)
++        else:
++            W = self.module_copy.to(device=target_device)
++            del self.module_copy
++        dead = torch.diag(self.H) == 0
++        self.H[dead, dead] = 1
++        W[:, dead] = 0
++
++        if is_rotated:
++            self.qcfg.act_group_aware = False    
++        else:
++            self.qcfg.act_group_aware = True    # Free lunch for BPDQ with better accuracy
++
++        if self.qcfg.act_group_aware:
++            diag_h = torch.diag(self.H)
++            local_perms, local_values = compute_local_perms(diag_h, group_size, return_values=True)
++            global_perm = compute_global_perm(diag_h, group_size, precomputed_values=local_values)
++            del local_values
++            final_perm = compose_final_perm(local_perms, global_perm, group_size)
++            W = W[:, final_perm]
++            self.H = self.H[final_perm][:, final_perm]
++
++        Hinv, damp = self.hessian_inverse(self.H)
++        if Hinv is None:
++            raise RuntimeError("BPDQ requires a non-None Hessian inverse (Hinv).")
++
++
++        c_list, B_list = [], []
++        Losses = torch.zeros_like(W)
++        Q = torch.zeros_like(W)
++
++        dtype_acc   = torch.float32  
++        dtype_store = torch.float32
++        # dtype_store = torch.bfloat16
++        candidate_vectors, candidate_vectors_float = self._get_bpdq_candidates(
++            k=msb_num, dtype=dtype_acc, device=target_device)
++
++
++
++        for i1 in range(0, self.columns, blocksize):
++            i2 = min(i1 + blocksize, self.columns)
++            count = i2 - i1
++
++            W1_acc = W[:, i1:i2].to(dtype_acc).clone()  
++            Q1 = torch.zeros((W.shape[0], count), dtype=dtype_store, device=target_device)
++            Losses1 = torch.zeros_like(W1_acc) 
++            Err1 = torch.zeros_like(W1_acc)
++
++            Hinv1 = Hinv[i1:i2, i1:i2].to(dtype_acc) 
++            d_diag = Hinv1.diagonal()
++
++            for g0 in range(0, count, group_size):
++                g1 = g0 + group_size
++                # self.quantizer.find_params(W[:, i1 + g0 : i1 + g1], weight=True)
++                self.quantizer.find_params(W1_acc[:, g0:g1], weight=True)
++                curr_scale = self.quantizer.scale.to(dtype_acc)
++                curr_zero  = self.quantizer.zero.to(dtype_acc)
++
++                W_target = W1_acc[:, g0:g1].contiguous().clone()        # Current target Weights
++                W_process = W1_acc[:, g0:count].contiguous().clone()    # W_process = Quantized Weights + Error propagation
++                # U_rows = torch.triu(Hinv1[g0:g1, g0:count])           # Eq. (4) W <- W - E*U_{l,l:}, U_{l,l:}=U_rows_local
++                U_rows = Hinv1[g0:g1, g0:count]                         # Eq. (4) W <- W - E*U_{l,l:}, U_{l,l:}=U_rows_local
++                d_loc = d_diag[g0:g1]                                   # Eq. (3): E=(W-W)/U_{l,l}, U_{l,l}=d_loc, i.e. error coordinate divisor
++
++                bpdq_results = self.quantizer.quantize_bpdq(
++                    W_target, curr_scale, curr_zero, W_process, U_rows,
++                    # U_loc=torch.triu(Hinv1[g0:g1, g0:g1])
++                    U_loc=Hinv1[g0:g1, g0:g1], d_loc=d_loc,
++                    bplane_bits=self.qcfg.bits, msb_num=msb_num, alpha=alpha,
++                    n_iters=n_iters, candidate_vectors=candidate_vectors, 
++                    candidate_vectors_float=candidate_vectors_float,
++                    dtype_store=dtype_store, dtype_acc=dtype_acc
++                )
++
++                W1_acc[:, g0:count] = bpdq_results["W_processing"]
++                Q1[:, g0:g1]        = bpdq_results["Q_store"]
++                Losses1[:, g0:g1]   = bpdq_results["E_group"].pow(2)
++                Err1[:, g0:g1]      = bpdq_results["E_group"]
++                B_final             = bpdq_results["B_final"]
++                c_store             = bpdq_results["c_store"]
++
++                if (c_store is not None) and (B_final is not None):
++                    if self.qcfg.act_group_aware:
++                        perm_group_idx = (i1 + g0) // group_size
++                        orig_group_idx = int(global_perm[perm_group_idx].item())
++                        lp = local_perms[orig_group_idx].to(dtype=torch.long)
++                        inv_lp = torch.empty_like(lp)
++                        inv_lp[lp] = torch.arange(group_size, device=lp.device, dtype=torch.long)
++                        B_store = B_final.index_select(dim=2, index=inv_lp)
++                    else:
++                        B_store = B_final
++                        
++                    B_packed_chunk = self._pack_lutgemm_int32(B_store)
++                    B_list.append(B_packed_chunk)
++                    c_list.append(c_store.permute(2, 1, 0))
++
++            Q[:, i1:i2] = Q1
++            Losses[:, i1:i2] = (Losses1 / 2).to(Losses.dtype)     
++            
++            # --- W update --- 
++            # Global Propagation
++            # corr_out = bpdq_results["E_group"].matmul(Hinv[i1 + count - group_size : i2, i2:].to(dtype_acc))
++            corr_out = Err1.matmul(Hinv[i1:i2, i2:].to(dtype_acc))
++            W[:, i2:] = (W[:, i2:].to(dtype_acc) - corr_out).to(W.dtype) 
++
++        # --- LOOP END ---
++        avg_loss = torch.sum(Losses).item() / self.nsamples if self.nsamples != 0 else 0.0
++        del Losses
++        del Hinv
++        del self.H
++
++        if self.qcfg.act_group_aware:
++            # recovery Q order
++            inv_final = invert_perm(final_perm)
++            Q = Q[:, inv_final]
++
++            # recovery (c, B) order
++            inv_global_perm_list = invert_perm(global_perm).tolist()
++            c_list = [c_list[i] for i in inv_global_perm_list]
++            B_list = [B_list[i] for i in inv_global_perm_list]
++
++            del final_perm, inv_final, global_perm, local_perms
++
++        # c = torch.cat(c_list, dim=0).to(torch.float16)
++        c = torch.cat(c_list, dim=0).to(self.module.weight.dtype)
++        B = torch.cat(B_list, dim=0) 
++
++
++        if self._tp_pad_cols:
++            valid_cols = self._original_columns
++            Q = Q[:, :valid_cols]
++
++        if isinstance(self.module, transformers.Conv1D):
++            Q = Q.t()
++
++        if Q.shape != self.module.weight.shape:
++            Q = Q.reshape(self.module.weight.shape).to(self.module.weight.dtype)
++        else:
++            Q = Q.to(self.module.weight.dtype)
++
++        Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
++        duration = time.time() - start
++
++        # quant_payload, dock to gptq_processor.py
++        quant_payload = {"c": c, "B": B}
++        return Q, quant_payload, duration, avg_loss, damp, self.nsamples
++
++__all__ = ["BPDQ"]
+diff --git a/gptqmodel/quantization/config.py b/gptqmodel/quantization/config.py
+index 97998f4..8be12fd 100644
+--- a/gptqmodel/quantization/config.py
++++ b/gptqmodel/quantization/config.py
+@@ -72,6 +72,7 @@ class FORMAT(str, Enum):
+     GEMV = "gemv"
+     GEMV_FAST = "gemv_fast"
+     LLM_AWQ = "llm-awq"
++    BPDQ = "bpdq"  ###
+ 
+ 
+ # quant methods
+@@ -79,6 +80,7 @@ class METHOD(str, Enum):
+     GPTQ = "gptq"
+     QQQ = "qqq"
+     AWQ = "awq"
++    BPDQ = "bpdq"  ###
+ 
+ 
+ class VramStrategy(str, Enum):
+@@ -385,12 +387,20 @@ class ExpertsRoutingOverride(BaseMoERouting):
+                 f"got {self.num_experts_per_tok}"
+             )
+ 
+-
++###
+ # MoE quantization: forward whole calibration dataset to each expert instead of only routed data
+ # This ensures all experts receive sufficient calibration samples but increases quantization time
+ @dataclass
+ class ExpertsRoutingBypass(BaseMoERouting):
+-    pass
++    # Number of modules to process in a single batch to reduce VRAM pressure during quantization
++    # For example, with batch_size=10 and 20 expert modules (gate_proj + up_proj for 10 experts):
++    # - First batch processes 10 modules (could be gate_proj for experts 0-9, or a mix depending on sorting)
++    # - Second batch processes remaining 10 modules
++    batch_size: Optional[int] = field(
++        default=None,
++        metadata={"help": "Number of modules to process in a single batch during MoE quantization"}
++    )
++###
+ 
+ 
+ @dataclass
+@@ -461,6 +471,7 @@ QUANT_METHOD_FORMAT_MAPPING = {
+         FORMAT.MARLIN,
+         FORMAT.LLM_AWQ,
+     },
++    METHOD.BPDQ: { FORMAT.BPDQ },  ###
+ }
+ 
+ # inference only methods should go here
+@@ -603,13 +614,33 @@ def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: st
+                     return default
+     return default
+ 
++
++@dataclass  ###
++class BPDQConfig:
++    msbits: int = field(default=4, metadata={"help": "BPDQ MSB bits number"})
++    n_iters: int = field(default=5, metadata={"help": "Number of iterations for BPDQ optimization"})
++    alpha: float = field(default=1e-4, metadata={"help": "Alpha parameter for BPDQ"})
++
++    def __post_init__(self):
++        if not isinstance(self.msbits, int) or self.msbits <= 0:
++            raise ValueError("BPDQConfig: `msbits` must be a positive integer.")
++        if not isinstance(self.n_iters, int) or self.n_iters <= 0:
++            raise ValueError("BPDQConfig: `n_iters` must be a positive integer.")
++        if not isinstance(self.alpha, (int, float)):
++            raise ValueError("BPDQConfig: `alpha` must be a numeric value.")
++
++
+ @dataclass
+ class QuantizeConfig():
+-    bits: int = field(default=4, metadata={"choices": [2, 3, 4, 8]})
++    bits: int = field(default=4, metadata={"choices": [2, 3, 4, 6, 8, 10, 12, 14, 16]})
+ 
+     # allow dynamic bitsize per layer, if None or some layer not set, use bits
+     dynamic: Optional[Dict[str, Dict[str, Union[int, bool]]]] = field(default=None)
+ 
++    # BPDQ only
++    bpdq: Optional[BPDQConfig] = field(default=None)  ###
++
++
+     # GPTQ only
+     # 128 offer good balance between inference speed, vram usage (bpw), and quality
+     # use 32 for highest quality with slower inference and higher vram usage
+@@ -724,14 +755,34 @@ class QuantizeConfig():
+         metadata={"help": "Wait for all layer finalization tasks (packing, offloading to disk, etc) to complete before proceeding to next layer. May reduce vram pressure for some env."}
+     )
+ 
++    # moe: MoEConfig = field(
++    #     default=None,
++    #     metadata={"help": "Mixture-of-Experts (MoE) configuration, including routing strategy and related overrides."}
++    # )###
+     moe: MoEConfig = field(
+         default=None,
+-        metadata={"help": "Mixture-of-Experts (MoE) configuration, including routing strategy and related overrides."}
+-    )
++        metadata={"help": "Mixture-of-Experts (MoE) configuration for routing strategy and expert batching. "
++                  "Example with bypass routing (forward all data to each expert): "
++                  "moe={'routing': {'class': 'ExpertsRoutingBypass', 'batch_size': None}} - processes all experts in one batch (default). "
++                  "moe={'routing': {'class': 'ExpertsRoutingBypass', 'batch_size': 4}} - processes 4 experts at a time to reduce VRAM pressure. "
++                  "Example with routing override (limit experts per token): "
++                  "moe={'routing': {'class': 'ExpertsRoutingOverride', 'num_experts_per_tok': 2}}. "
++                  "Example to forward to all experts: "
++                  "moe={'routing': {'class': 'ExpertsRoutingOverride', 'num_experts_per_tok': 'all'}}"}
++    )###
+ 
+     def __post_init__(self):
+         fields_info = fields(self)
+ 
++        ###
++        if self.bpdq is not None and isinstance(self.bpdq, dict):
++            self.bpdq = BPDQConfig(**self.bpdq)
++        elif self.bpdq is not None and not isinstance(self.bpdq, BPDQConfig):
++             raise ValueError("QuantizeConfig: `bpdq` must be a BPDQConfig, dict, or None.")
++        ###
++
++
++
+         # validate/normalizes pack_dtype from string and dtype to valid dtype
+         if self.pack_dtype is None:
+             self.pack_dtype = torch.int32
+@@ -839,8 +890,8 @@ class QuantizeConfig():
+ 
+         if self.dynamic is not None:
+             self.dynamic = {
+-                **{k: v for k, v in self.dynamic.items() if k.startswith('-')},  # 先添加以 "-" 开头的键
+-                **{k: v for k, v in self.dynamic.items() if not k.startswith('-')}  # 然后添加其他键
++                **{k: v for k, v in self.dynamic.items() if k.startswith('-')},  
++                **{k: v for k, v in self.dynamic.items() if not k.startswith('-')} 
+             }
+ 
+             for layer, layer_dict in self.dynamic.items():
+@@ -1043,7 +1094,7 @@ class QuantizeConfig():
+     @classmethod
+     # normalize quant config for compat and also performs validation
+     def from_quant_config(cls, quantize_cfg, format: str = None):
+-        valid_formats = {FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.MARLIN, FORMAT.BITBLAS}
++        valid_formats = {FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.MARLIN, FORMAT.BITBLAS, FORMAT.BPDQ}
+         format_auto_inferred = False
+         # compat: format can be passed in via from_quantized() if field missing from json
+         if format:
+@@ -1077,7 +1128,7 @@ class QuantizeConfig():
+             if key == FORMAT_FIELD_CHECKPOINT:
+                 val = val.lower()
+ 
+-                if val in {FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.MARLIN, FORMAT.BITBLAS}:
++                if val in {FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.MARLIN, FORMAT.BITBLAS, FORMAT.BPDQ}:
+                     normalized[key] = val
+                 else:
+                     raise ValueError(f"QuantizeConfig: Unknown quantization format: `{val}`.")
+@@ -1088,7 +1139,7 @@ class QuantizeConfig():
+                     normalized[FORMAT_FIELD_CODE] = FORMAT.MARLIN
+                 elif val == FORMAT.BITBLAS:
+                     normalized[FORMAT_FIELD_CODE] = FORMAT.BITBLAS
+-                elif val not in {METHOD.GPTQ, METHOD.QQQ, METHOD.AWQ}:
++                elif val not in {METHOD.GPTQ, METHOD.QQQ, METHOD.AWQ, METHOD.BPDQ}:
+                     raise ValueError(f"QuantizeConfig: Unknown quantization method: `{val}`.")
+                 else:
+                     normalized[QUANT_METHOD_FIELD] = val
+@@ -1142,6 +1193,11 @@ class QuantizeConfig():
+             )
+ 
+         meta_payload = normalized.get(META_FIELD)
++
++        ###
++        if "bpdq" not in normalized and isinstance(meta_payload, dict) and "bpdq" in meta_payload:
++            normalized["bpdq"] = meta_payload.get("bpdq")
++
+         if "failsafe" not in normalized and isinstance(meta_payload, dict) and "failsafe" in meta_payload:
+             normalized["failsafe"] = meta_payload.get("failsafe")
+         if "hessian" not in normalized and isinstance(meta_payload, dict) and "hessian" in meta_payload:
+@@ -1228,6 +1284,19 @@ class QuantizeConfig():
+             smooth = payload
+ 
+         meta_payload = dict(self.meta) if self.meta else {}
++
++
++        ###
++        if self.bpdq is None:
++            meta_payload["bpdq"] = None
++        else:
++            meta_payload["bpdq"] = {
++                "msbits": self.bpdq.msbits,
++                "n_iters": self.bpdq.n_iters,
++                "alpha": self.bpdq.alpha,
++            }
++
++
+         if self.moe:
+             meta_payload["moe"] = self.moe.to_dict()
+ 
+@@ -1278,6 +1347,7 @@ class QuantizeConfig():
+             # torch.dtype convert to string
+             PACK_DTYPE_FIELD: str(self.pack_dtype).split(".")[-1],
+             META_FIELD: meta_payload,
++            "rotation": self.rotation, 
+             # DO NOT EXPORT Adapter to config/json since adapter can be swapped out/in
+             # ADAPTER_FIELD: self.adapter.to_dict() if self.adapter else None,
+             # DO NOT EXPORT compute_device_filter since functions are not serializable
+@@ -1306,6 +1376,7 @@ class QuantizeConfig():
+         return out
+ 
+      # TODO FIX ME, g_idx int32 per infeature but infeature count is per module
++
+     def calculate_bits_per_weight(self):
+         if self.group_size != -1:
+             # naive bits is
+diff --git a/gptqmodel/quantization/gptq.py b/gptqmodel/quantization/gptq.py
+index ae0921a..a01141a 100644
+--- a/gptqmodel/quantization/gptq.py
++++ b/gptqmodel/quantization/gptq.py
+@@ -564,6 +564,7 @@ class GPTQ:
+                 result_accum = self.H
+                 result_accum.zero_()
+             else:
++                torch_sync(device) # try to avoid torch.AcceleratorError: CUDA error: unspecified launch failure
+                 result_accum = torch.zeros(
+                     (self.columns, self.columns),
+                     dtype=torch.float32,
+@@ -904,9 +905,14 @@ class GPTQ:
+                 f"Quantization: Module `{self.name}` -> "
+                 f"Using `{resolved_strategy.value}` failsafe quantization (observed {self.nsamples} samples, threshold={threshold_text}{threshold_info}, max_total={self.expected_nsamples})."
+             )
++            # self.H = self.create_H(target_device=target_device)
++            # return self._failsafe_quantize(resolved_strategy, blocksize)
++            ###
+             self.H = self.create_H(target_device=target_device)
+-
+-            return self._failsafe_quantize(resolved_strategy, blocksize)
++            Q, scale, zero, g_idx, duration, avg_loss, damp, nsamples = self._failsafe_quantize(resolved_strategy, blocksize)
++            quant_payload = {"q_scales": scale, "q_zeros": zero, "q_g_idx": g_idx}
++            return Q, quant_payload, duration, avg_loss, damp, nsamples
++            ###
+         else:
+             use_hessian = True
+             self.finalize_hessian(target_device=target_device)
+@@ -1226,10 +1232,14 @@ class GPTQ:
+             zero = self.truncate_last_dim(zero, valid_cols)
+ 
+         Q = Q.to(device=self.module.weight.data.device, non_blocking=False)
+-
+         duration = time.time() - start
++        # return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
++        ###
++        quant_payload = {"q_scales": scale, "q_zeros": zero, "q_g_idx": g_idx}
++        return Q, quant_payload, duration, avg_loss, damp, self.nsamples
++
++
+ 
+-        return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
+ 
+     def borrow_materialized_chunk_stats(self, reset: bool = False) -> Dict[str, int]:
+         stats = dict(self._borrow_workspace_stats)
+diff --git a/gptqmodel/quantization/rotation/rotation.py b/gptqmodel/quantization/rotation/rotation.py
+index 110e451..177da10 100644
+--- a/gptqmodel/quantization/rotation/rotation.py
++++ b/gptqmodel/quantization/rotation/rotation.py
+@@ -4,6 +4,7 @@
+ # Contact: qubitium@modelcloud.ai, x.com/qubitium
+ 
+ # Adapted from https://github.com/spcl/QuaRot/blob/main/fake_quant/rotation_utils.py
++import os
+ import typing
+ 
+ import torch
+@@ -17,6 +18,37 @@ from .hadamard_utils import apply_exact_had_to_linear, random_hadamard_matrix
+ 
+ log = setup_logger()
+ 
++def _materialize_meta_weights(model: PreTrainedModel, device: str = "cpu") -> None:
++
++    has_meta = any(
++        p.device.type == "meta"
++        for p in model.parameters()
++    )
++    if not has_meta:
++        return  
++
++    model_path = getattr(model.config, "_name_or_path", None)
++    if not model_path or not os.path.isdir(model_path):
++        raise RuntimeError(
++            f"rotate_model: detected meta tensors, but failed to locate the model files.\n"
++            f"  model.config._name_or_path = '{model_path}'\n"
++            f"  Please make sure the model is loaded from a local directory, "
++            f"or load the weights manually before rotation."
++        )
++    log.info(f"rotate_model: meta tensors detected, materializing weights from local path: {model_path}")
++    try:
++        from accelerate import load_checkpoint_in_model
++        load_checkpoint_in_model(
++            model,
++            checkpoint=model_path,
++            device_map={"": device},
++        )
++        log.info("rotate_model: weight materialization completed")
++    except Exception as exc:
++        raise RuntimeError(
++            f"rotate_model: failed to materialize meta tensors: {exc}\n"
++            f"  checkpoint path: {model_path}"
++        ) from exc
+ 
+ def fuse_ln_linear(
+         layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]
+@@ -109,6 +141,10 @@ def get_embeddings(model) -> list[torch.nn.Module]:
+ 
+ 
+ def rotate_embeddings(model, Q, device) -> None:
++    print(model.model.embed_tokens.weight.device)   
++    print(model.lm_head.weight.device)              
++    print(model.model.embed_tokens.weight is model.lm_head.weight)  
++
+     # Rotate the embeddings.
+     for W in get_embeddings(model):
+         dtype = W.weight.data.dtype
+@@ -159,6 +195,10 @@ def rotate_mlp_output(layer, Q, device):
+ def rotate_head(model, Q, device, lm_head_name) -> None:
+     # Rotate the head.
+     W, _ = get_module_by_name_prefix(model, lm_head_name)
++
++    if W.weight is model.model.embed_tokens.weight:
++        return
++    
+     dtype = W.weight.data.dtype
+     W_ = W.weight.data.to(device=device, dtype=torch.float64)
+     W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+@@ -173,8 +213,15 @@ def rotate_ov_proj(layer, head_num, head_dim):
+ 
+ 
+ @torch.inference_mode()
++# def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
++#                  layers_node: str, Q=None):
+ def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+-                 layers_node: str, Q=None):
++                 layers_node: str, pre_lm_head_norm_module_name: str, Q=None):
++    _materialize_meta_weights(model, device="cpu")
++
++    model = fuse_layer_norms(model, pre_lm_head_norm_module_name, layers_node, lm_head_name)
++    log.info("Successfully fused LayerNorms into adjacent Linear layers.")
++
+     Q = (
+         get_orthogonal_matrix(
+             model.config.hidden_size, rotate_mode, device
+diff --git a/gptqmodel/utils/model.py b/gptqmodel/utils/model.py
+index 3ba42dd..1924e4e 100644
+--- a/gptqmodel/utils/model.py
++++ b/gptqmodel/utils/model.py
+@@ -267,6 +267,11 @@ def make_quant(
+     if not pack and format in (FORMAT.GPTQ, FORMAT.GPTQ_V2) and backend == BACKEND.BITBLAS:
+         backend = BACKEND.TORCH
+ 
++    ### BPDQ params 
++    extra_kwargs = {}
++    if qcfg.quant_method == METHOD.BPDQ and qcfg.bpdq is not None:
++        extra_kwargs["msbits"] = qcfg.bpdq.msbits
++
+     # returns multiple validated kernels
+     quant_linear_candidates = select_quant_linear(
+         bits=bits,
+@@ -308,6 +313,7 @@ def make_quant(
+                 pack_dtype=pack_dtype,
+                 backend=backend,
+                 adapter=qcfg.adapter,
++                **extra_kwargs  ### BPDQ params 
+             )
+             log.info(f"Kernel: selected -> `{linear_cls.__name__}`.")
+             return linear_cls
+@@ -336,7 +342,7 @@ def create_quant_module(
+     backend: BACKEND = BACKEND.AUTO,
+     register_buffers: bool = True,
+     adapter: Optional[Adapter] = None,
+-
++    **kwargs ###
+ ):
+     # unwrap named module
+     if isinstance(submodule, NamedModule):
+@@ -432,6 +438,7 @@ def create_quant_module(
+         backend=backend,
+         register_buffers=register_buffers,
+         adapter=adapter,
++        **kwargs ###
+     )
+     new_layer.device = ori_layer_device
+     recurse_setattr(module, name, new_layer.to(ori_layer_device))
+@@ -450,7 +457,7 @@ def create_quant_layer(
+         pack_dtype: torch.dtype,
+         backend: BACKEND,
+         adapter: Optional[Adapter] = None,
+-
++        **kwargs ###
+ ) -> Type[BaseQuantLinear]:
+     if isinstance(module, linear_cls):
+         return linear_cls
+@@ -474,6 +481,7 @@ def create_quant_layer(
+             pack_dtype=pack_dtype,
+             backend=backend,
+             adapter=adapter,
++            **kwargs ###
+         )
+ 
+     return linear_cls
+@@ -690,6 +698,7 @@ def pack_module(
+     q_scales_extra=None,
+     quantize_config: Optional[QuantizeConfig] = None,
+     quant_result: Optional[Dict[str, Any]] = None,
++    **kwargs ###
+ ):
+     # Limit pack() thread usage to avoid auto-parallizataion regression
+     # with ctx(tctl.threadpool_limits(limits=1), lock):
+@@ -698,8 +707,16 @@ def pack_module(
+ 
+     assert get_device(module) == CPU
+     assert get_device(layer) == CPU
+-    assert get_device(q_scales) == CPU
+-    assert get_device(q_zeros) == CPU
++
++    # assert get_device(q_scales) == CPU
++    # assert get_device(q_zeros) == CPU
++    ###
++    if q_scales is not None:
++        assert get_device(q_scales) == CPU
++    if q_zeros is not None:
++        assert get_device(q_zeros) == CPU
++    ###
++
+ 
+     # module = module.to(CPU)
+     # layer = layer.to(CPU)
+@@ -759,6 +776,15 @@ def pack_module(
+                 zeros=q_zeros,
+                 g_idx=q_g_idx,
+             )
++    ### BPDQ brench
++    elif quant_linear_cls.QUANT_TYPE == "bpdq":
++        packer_label = "module.pack_bpdq"
++        with log_time_block(
++            packer_label,
++            logger=log,
++            module_name=name,
++        ):
++            module.pack(linear=layer, **kwargs)
+     else:
+         effective_impl = (pack_impl or "original").lower()
+ 

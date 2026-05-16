@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Outputs from running the workflow
+outputs/
+*.log
+run_stats_*.json
+eval_results/
+quant_model/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
